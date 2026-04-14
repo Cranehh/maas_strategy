@@ -4,13 +4,14 @@ MaaS ABM Optimization Framework - Main Entry Point
 Usage:
     python main.py [--scenario S0_baseline] [--quick] [--seed 42]
     python main.py --all-scenarios --output results
+    python main.py --method trmobo   (default: ANP + TR-MOBO)
 
 Workflow:
     1. Load agent population from 2023 travel survey + SP survey data
     2. Initialize Ch3 (bundle choice), Ch1 (trial), Ch2 (subscription) models
     3. Create ABM engine with Bass-diffusion + spatial network effects
     4. Either run a quick single-evaluation test (--quick) or
-       full NSGA-II multi-objective optimisation
+       full TR-MOBO multi-objective optimisation
     5. Generate visualisations and save results
 """
 
@@ -26,7 +27,7 @@ from config import (
     THETA_DEFAULT, THETA_NAMES, N_THETA,
     THETA_LOWER, THETA_UPPER,
     N_WEEKS, AGENT_WEIGHT,
-    NSGA2_POP_SIZE, NSGA2_N_GEN,
+    TRMOBO_MAX_ITERATIONS, TRMOBO_INIT_SAMPLES,
 )
 import data_loader
 import ch3_model
@@ -35,9 +36,9 @@ import ch2_model
 from abm_engine import ABMSimulation
 from scenarios import get_scenario, SCENARIOS
 
-# Lazy imports for modules requiring scikit-learn / pymoo (not needed for --quick)
+# Lazy imports for modules requiring torch / scikit-learn (not needed for --quick)
 def _import_optimizer():
-    from surrogate import AnalyticalSurrogate, GPResidualModel, SurrogateEvaluator
+    from surrogate import AnalyticalSurrogate, NPSurrogateEvaluator
     from optimizer import run_optimization
     return run_optimization
 
@@ -75,6 +76,10 @@ def main():
     parser.add_argument(
         '--all-scenarios', action='store_true',
         help='Run all 5 scenarios sequentially',
+    )
+    parser.add_argument(
+        '--method', default='trmobo', choices=['trmobo'],
+        help='Optimization method (default: trmobo)',
     )
     args = parser.parse_args()
 
@@ -173,7 +178,7 @@ def _run_quick_test(abm, agents, args):
 # ==================================================================
 
 def _run_optimisation(abm, agents, args):
-    """Run NSGA-II optimisation for one or all scenarios."""
+    """Run TR-MOBO optimisation for one or all scenarios."""
     import visualization as viz
     run_optimization = _import_optimizer()
 
@@ -198,19 +203,23 @@ def _run_optimisation(abm, agents, args):
 
         scenario_label, modifier = get_scenario(scenario_name)
         print(f"  Label: {scenario_label}")
-        print(f"  Population size: {NSGA2_POP_SIZE}")
-        print(f"  Generations: {NSGA2_N_GEN}")
+        print(f"  Method: TR-MOBO (ANP + EHVI)")
+        print(f"  Init samples: {TRMOBO_INIT_SAMPLES}")
+        print(f"  Max iterations: {TRMOBO_MAX_ITERATIONS}")
 
         t0 = time.time()
-        result, pareto_X, pareto_F, history = run_optimization(
+        result_dict, pareto_X, pareto_F, history = run_optimization(
             agents, abm_func, ch3_model, ch1_model, ch2_model,
             scenario_modifier=modifier,
         )
         elapsed = time.time() - t0
 
         n_solutions = pareto_F.shape[0] if pareto_F.ndim == 2 else 1
+        n_iterations = result_dict.get('n_iterations', 0)
+        converged = result_dict.get('converged', False)
         print(f"  Optimisation completed in {elapsed:.1f}s")
         print(f"  Pareto solutions found: {n_solutions}")
+        print(f"  Iterations: {n_iterations}, Converged: {converged}")
 
         all_results[scenario_name] = (pareto_X, pareto_F, history)
 
@@ -234,7 +243,7 @@ def _run_optimisation(abm, agents, args):
             save_path=pareto_path,
         )
 
-        # Convergence plot
+        # Convergence plot (hypervolume history)
         if history is not None:
             conv_path = os.path.join(
                 args.output, f'{scenario_name}_convergence.png'
@@ -243,6 +252,19 @@ def _run_optimisation(abm, agents, args):
                 history,
                 save_path=conv_path,
             )
+
+            # TR convergence plot (new visualization)
+            if 'iteration_history' in history:
+                try:
+                    tr_conv_path = os.path.join(
+                        args.output, f'{scenario_name}_tr_convergence.png'
+                    )
+                    viz.plot_tr_convergence(
+                        history['iteration_history'],
+                        save_path=tr_conv_path,
+                    )
+                except Exception as e:
+                    print(f"  Warning: TR convergence plot failed: {e}")
 
         # Print summary of extreme solutions
         _print_pareto_summary(pareto_F, scenario_label)

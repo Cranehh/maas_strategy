@@ -1,312 +1,421 @@
 """
-Multi-objective optimisation for the MaaS ABM framework.
+TR-MOBO multi-objective optimisation for the MaaS ABM framework.
 
-Implements a Surrogate-Based Optimisation (SBO) pipeline:
-    Phase A: Latin Hypercube Sampling for initial GP training
-    Phase B: NSGA-II with infill callbacks for GP refinement
+Implements:
+    Phase 0: Analytical pretraining of ANP
+    Phase A: ABM calibration (LHS + finetune + residual model)
+    Phase B: TR-MOBO main loop (EHVI acquisition + trust region updates)
     Phase C: Pareto front verification via full ABM runs
-
-Uses pymoo for NSGA-II with 17 decision variables, 4 objectives, and
-2 inequality constraints.
 """
 
 import logging
 import time
 
 import numpy as np
-from pymoo.core.problem import Problem
-from pymoo.core.callback import Callback
-from pymoo.algorithms.moo.nsga2 import NSGA2
-from pymoo.operators.crossover.sbx import SBX
-from pymoo.operators.mutation.pm import PM
-from pymoo.operators.sampling.lhs import LHS
-from pymoo.optimize import minimize
-from pymoo.termination import get_termination
+from scipy.stats.qmc import LatinHypercube
 
 from config import (
     THETA_LOWER, THETA_UPPER, N_THETA,
-    LHS_SAMPLES, NSGA2_POP_SIZE, NSGA2_N_GEN,
-    INFILL_PER_GEN, PARETO_VERIFY_N, PARETO_VERIFY_SEEDS,
+    TRMOBO_INIT_SAMPLES, TRMOBO_MAX_ITERATIONS,
+    TRMOBO_CONVERGENCE_PATIENCE, TRMOBO_CONVERGENCE_EPS,
+    ANP_PRETRAIN_SAMPLES, ANP_PRETRAIN_EPOCHS, ANP_PRETRAIN_LR,
+    ANP_FINETUNE_EPOCHS, ANP_FINETUNE_LR,
+    ANP_CONTINUAL_FINETUNE_EVERY, ANP_CONTINUAL_FINETUNE_EPOCHS,
+    RESIDUAL_METHOD, RESIDUAL_SWITCH_THRESHOLD,
+    PARETO_VERIFY_N, PARETO_VERIFY_SEEDS,
+    EHVI_REFERENCE_POINT,
+    IDX_OBJ_START, N_INTERMEDIATES,
 )
-from surrogate import AnalyticalSurrogate, GPResidualModel, SurrogateEvaluator
+from surrogate import (
+    AnalyticalSurrogate, QuadraticResidualModel, GPResidualModel,
+    NPSurrogateEvaluator,
+)
+from neural_process import (
+    AttentiveNeuralProcess, ANPTrainer, ANPPredictor,
+    aggregate_condition_vector,
+)
+from trust_region import (
+    TrustRegion, MultiTrustRegionManager,
+    compute_hypervolume, compute_ehvi, maximize_ehvi_in_tr,
+    compute_improvement_ratio,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # ================================================================== #
-#  1. NSGA-II Problem Definition                                       #
+#  LHS Sampling                                                        #
 # ================================================================== #
 
-class MaaSSBOProblem(Problem):
-    """NSGA-II problem wrapper for the MaaS surrogate evaluator.
-
-    Decision variables (17):
-        See config.THETA_NAMES for the full layout.
-
-    Objectives (4, all minimised):
-        0: -adoption_rate       (maximise adoption)
-        1: -net_revenue         (maximise revenue)
-        2: gini_coefficient     (minimise inequality)
-        3: -carbon_reduction    (maximise carbon reduction)
-
-    Inequality constraints (2):
-        G[0] = ps_BF - ps_MA <= 0
-            BF bundle must be cheaper than MA bundle (price-scale ordering).
-        G[1] = tau_low - tau_high <= 0
-            Low awareness threshold must not exceed high threshold.
-    """
-
-    def __init__(self, surrogate_evaluator):
-        """
-        Parameters
-        ----------
-        surrogate_evaluator : SurrogateEvaluator
-            Combined analytical + GP surrogate evaluator.
-        """
-        super().__init__(
-            n_var=N_THETA,
-            n_obj=4,
-            n_ieq_constr=2,
-            xl=THETA_LOWER,
-            xu=THETA_UPPER,
-        )
-        self.evaluator_model = surrogate_evaluator
-
-    def _evaluate(self, X, out, *args, **kwargs):
-        """Batch-evaluate the population.
-
-        Parameters
-        ----------
-        X : ndarray[pop_size, 17]
-            Decision variable matrix.
-        out : dict
-            pymoo output dictionary. Sets:
-            - out["F"]: ndarray[pop_size, 4] objectives
-            - out["G"]: ndarray[pop_size, 2] constraints
-        """
-        pop_size = X.shape[0]
-
-        # Evaluate objectives via surrogate
-        F, U = self.evaluator_model.evaluate_batch(X)
-
-        # Inequality constraints: G[i] <= 0 is feasible
-        G = np.zeros((pop_size, 2), dtype=np.float64)
-
-        # Constraint 1: ps_BF <= ps_MA  =>  ps_BF - ps_MA <= 0
-        # theta[1] = ps_BF, theta[3] = ps_MA
-        G[:, 0] = X[:, 1] - X[:, 3]
-
-        # Constraint 2: tau_low <= tau_high  =>  tau_low - tau_high <= 0
-        # theta[7] = tau_low, theta[6] = tau_high
-        G[:, 1] = X[:, 7] - X[:, 6]
-
-        out["F"] = F
-        out["G"] = G
-
-        # Store uncertainty for potential use by infill callback
-        if hasattr(self, '_last_uncertainty'):
-            self._last_uncertainty = U
-        else:
-            self._last_uncertainty = U
-
-
-# ================================================================== #
-#  2. Infill Callback for GP Refinement                                #
-# ================================================================== #
-
-class InfillCallback(Callback):
-    """Every generation, select top candidates for ABM evaluation and update GP.
-
-    Selection strategy:
-        1. From the current population, find solutions near the Pareto front.
-        2. Among those, select the ones with highest GP uncertainty.
-        3. Run the full ABM on these solutions to get true objectives.
-        4. Compute residuals (true - analytical) and update the GP.
-    """
-
-    def __init__(self, abm, agents, analytical, gp_model, n_infill=INFILL_PER_GEN):
-        """
-        Parameters
-        ----------
-        abm : callable
-            ABM evaluation function: abm(theta, agents) -> ndarray[4].
-        agents : dict[str, ndarray[N]]
-            Agent population.
-        analytical : AnalyticalSurrogate
-            Analytical surrogate for computing residuals.
-        gp_model : GPResidualModel
-            GP residual model to update.
-        n_infill : int
-            Number of ABM evaluations per generation.
-        """
-        super().__init__()
-        self.abm = abm
-        self.agents = agents
-        self.analytical = analytical
-        self.gp = gp_model
-        self.n_infill = n_infill
-
-        # Track cumulative ABM evaluations
-        self.total_abm_evals = 0
-        self.infill_history_X = []
-        self.infill_history_F = []
-
-    def notify(self, algorithm):
-        """Called at the end of each generation.
-
-        Selects high-uncertainty Pareto-near solutions for ABM evaluation
-        and updates the GP residual model.
-        """
-        gen = algorithm.n_gen
-        pop = algorithm.pop
-
-        # Only run infill every few generations to amortise ABM cost
-        if gen % 5 != 0 and gen > 1:
-            return
-
-        X_pop = pop.get("X")      # (pop_size, 17)
-        F_pop = pop.get("F")      # (pop_size, 4)
-
-        if X_pop is None or F_pop is None:
-            return
-
-        pop_size = X_pop.shape[0]
-
-        # ---- Step 1: Compute uncertainty for each individual ----
-        _, U = self.gp.predict(X_pop) if self.gp.fitted else (
-            np.zeros((pop_size, 4)), np.ones((pop_size, 4)))
-
-        # Aggregate uncertainty: sum of std across objectives
-        total_uncertainty = U.sum(axis=1)  # (pop_size,)
-
-        # ---- Step 2: Identify Pareto-near solutions ----
-        # Use non-dominated rank (approximate: compare each to population)
-        is_nondominated = np.ones(pop_size, dtype=bool)
-        for i in range(pop_size):
-            for j in range(pop_size):
-                if i == j:
-                    continue
-                if np.all(F_pop[j] <= F_pop[i]) and np.any(F_pop[j] < F_pop[i]):
-                    is_nondominated[i] = False
-                    break
-
-        # ---- Step 3: Score = uncertainty, with bonus for Pareto-near ----
-        scores = total_uncertainty.copy()
-        scores[is_nondominated] *= 2.0  # Double weight for Pareto front members
-
-        # Select top-n_infill candidates
-        n_select = min(self.n_infill, pop_size)
-        selected_idx = np.argsort(scores)[-n_select:]
-
-        X_selected = X_pop[selected_idx]
-
-        # ---- Step 4: Run ABM on selected candidates ----
-        F_true = np.zeros((n_select, 4), dtype=np.float64)
-        F_analytical = np.zeros((n_select, 4), dtype=np.float64)
-
-        for i in range(n_select):
-            try:
-                F_true[i] = self.abm(X_selected[i], self.agents)
-                F_analytical[i] = self.analytical.evaluate(X_selected[i])
-            except Exception as e:
-                logger.warning(
-                    "ABM evaluation failed for infill point %d at gen %d: %s",
-                    i, gen, e)
-                F_true[i] = F_analytical[i]  # fallback: zero residual
-
-        residuals = F_true - F_analytical
-
-        # ---- Step 5: Update GP ----
-        self.gp.update(X_selected, residuals)
-
-        # Track history
-        self.total_abm_evals += n_select
-        self.infill_history_X.append(X_selected)
-        self.infill_history_F.append(F_true)
-
-        logger.info(
-            "Gen %d: infill %d points, total ABM evals = %d, "
-            "GP training size = %d",
-            gen, n_select, self.total_abm_evals, self.gp.n_training)
-
-
-# ================================================================== #
-#  3. LHS Initialisation                                               #
-# ================================================================== #
-
-def _generate_lhs_samples(n_samples=LHS_SAMPLES):
+def _generate_lhs_samples(n_samples, bounds_lower=THETA_LOWER,
+                           bounds_upper=THETA_UPPER):
     """Generate Latin Hypercube samples in the theta parameter space.
 
     Returns
     -------
     X : ndarray[n_samples, 17]
-        LHS samples within [THETA_LOWER, THETA_UPPER].
     """
-    from scipy.stats.qmc import LatinHypercube
-
     sampler = LatinHypercube(d=N_THETA, seed=42)
-    X_unit = sampler.random(n=n_samples)  # (n_samples, 17) in [0,1]
-
-    # Scale to parameter bounds
-    X = THETA_LOWER + X_unit * (THETA_UPPER - THETA_LOWER)
-
+    X_unit = sampler.random(n=n_samples)
+    X = bounds_lower + X_unit * (bounds_upper - bounds_lower)
     return X
 
 
-def _initial_gp_training(X_lhs, abm, agents, analytical):
-    """Run ABM on LHS samples and train the initial GP.
+# ================================================================== #
+#  Pareto Front Utilities                                              #
+# ================================================================== #
+
+def _update_pareto_front(X_all, F_all):
+    """Extract non-dominated solutions from all evaluated points.
 
     Parameters
     ----------
-    X_lhs : ndarray[n, 17]
-    abm : callable
-        abm(theta, agents) -> ndarray[4]
-    agents : dict
-    analytical : AnalyticalSurrogate
+    X_all : ndarray (n, 17)
+    F_all : ndarray (n, 4)
 
     Returns
     -------
-    gp_model : GPResidualModel
-        Fitted GP residual model.
-    F_true : ndarray[n, 4]
-        True ABM objectives for LHS samples.
-    F_analytical : ndarray[n, 4]
-        Analytical surrogate objectives for LHS samples.
+    pareto_X : ndarray (m, 17)
+    pareto_F : ndarray (m, 4)
     """
-    n = X_lhs.shape[0]
-    F_true = np.zeros((n, 4), dtype=np.float64)
-    F_analytical = np.zeros((n, 4), dtype=np.float64)
-
-    logger.info("Phase A: Running ABM on %d LHS samples...", n)
-    t0 = time.time()
-
+    n = F_all.shape[0]
+    is_pareto = np.ones(n, dtype=bool)
     for i in range(n):
-        if (i + 1) % 10 == 0:
-            elapsed = time.time() - t0
-            eta = elapsed / (i + 1) * (n - i - 1)
-            logger.info("  LHS sample %d/%d  (elapsed: %.1fs, ETA: %.1fs)",
-                        i + 1, n, elapsed, eta)
-        try:
-            F_true[i] = abm(X_lhs[i], agents)
-        except Exception as e:
-            logger.warning("ABM failed on LHS sample %d: %s", i, e)
-            F_true[i] = np.zeros(4)
-
-        F_analytical[i] = analytical.evaluate(X_lhs[i])
-
-    residuals = F_true - F_analytical
-    elapsed = time.time() - t0
-    logger.info("Phase A complete: %d ABM evaluations in %.1fs", n, elapsed)
-
-    # Fit GP
-    gp_model = GPResidualModel()
-    gp_model.fit(X_lhs, residuals)
-
-    return gp_model, F_true, F_analytical
+        if not is_pareto[i]:
+            continue
+        for j in range(n):
+            if i == j or not is_pareto[j]:
+                continue
+            if np.all(F_all[j] <= F_all[i]) and np.any(F_all[j] < F_all[i]):
+                is_pareto[i] = False
+                break
+    return X_all[is_pareto], F_all[is_pareto]
 
 
 # ================================================================== #
-#  4. Pareto Front Verification                                        #
+#  Phase 0: Analytical Pretraining                                     #
+# ================================================================== #
+
+def _phase0_analytical_pretrain(agents, analytical, condition_vec):
+    """Phase 0: Pretrain ANP on analytical surrogate data.
+
+    Parameters
+    ----------
+    agents : dict
+    analytical : AnalyticalSurrogate
+    condition_vec : ndarray (96,)
+
+    Returns
+    -------
+    anp_model : AttentiveNeuralProcess
+    anp_trainer : ANPTrainer
+    """
+    logger.info("Phase 0: Analytical pretraining of ANP")
+    logger.info("  Generating %d LHS samples for pretraining...",
+                ANP_PRETRAIN_SAMPLES)
+
+    # 1. LHS sampling
+    X_pretrain = _generate_lhs_samples(ANP_PRETRAIN_SAMPLES)
+
+    # 2. Evaluate with analytical surrogate (13-dim: 9 intermediates + 4 objectives)
+    Y_pretrain = np.zeros((ANP_PRETRAIN_SAMPLES, IDX_OBJ_START + 4), dtype=np.float64)
+    for i in range(ANP_PRETRAIN_SAMPLES):
+        Y_pretrain[i] = analytical.evaluate_with_intermediates(X_pretrain[i])
+        if (i + 1) % 500 == 0:
+            logger.info("  Analytical eval: %d/%d", i + 1, ANP_PRETRAIN_SAMPLES)
+
+    # 3. Create ANP model
+    anp_model = AttentiveNeuralProcess()
+    anp_trainer = ANPTrainer(anp_model, lr=ANP_PRETRAIN_LR)
+
+    # 4. Pretrain on 13-dim data
+    analytical_data = {'theta': X_pretrain, 'y': Y_pretrain}
+    anp_trainer.pretrain(
+        analytical_data, condition_vec,
+        epochs=ANP_PRETRAIN_EPOCHS,
+    )
+
+    logger.info("Phase 0 complete: ANP pretrained on %d analytical samples",
+                ANP_PRETRAIN_SAMPLES)
+    return anp_model, anp_trainer
+
+
+# ================================================================== #
+#  Phase A: ABM Calibration                                            #
+# ================================================================== #
+
+def _phase_a_abm_calibration(anp_model, anp_trainer, analytical,
+                              abm, agents, condition_vec):
+    """Phase A: Calibrate ANP with ABM data and build residual model.
+
+    Parameters
+    ----------
+    anp_model : AttentiveNeuralProcess
+    anp_trainer : ANPTrainer
+    analytical : AnalyticalSurrogate
+    abm : callable
+    agents : dict
+    condition_vec : ndarray (96,)
+
+    Returns
+    -------
+    surrogate : NPSurrogateEvaluator
+    tr_manager : MultiTrustRegionManager
+    context_data : dict {'theta': ndarray, 'y': ndarray}
+    residual_model : QuadraticResidualModel or GPResidualModel
+    X_abm : ndarray (n, 17)
+    F_abm : ndarray (n, 4)
+    """
+    logger.info("=" * 60)
+    logger.info("Phase A: ABM Calibration")
+    logger.info("=" * 60)
+
+    # 1. LHS sampling for ABM evaluation
+    X_abm = _generate_lhs_samples(TRMOBO_INIT_SAMPLES)
+    F_abm_obj = np.zeros((TRMOBO_INIT_SAMPLES, 4), dtype=np.float64)
+
+    logger.info("  Running ABM on %d LHS samples...", TRMOBO_INIT_SAMPLES)
+    t0 = time.time()
+    for i in range(TRMOBO_INIT_SAMPLES):
+        try:
+            F_abm_obj[i] = abm(X_abm[i], agents)
+        except Exception as e:
+            logger.warning("ABM failed on sample %d: %s", i, e)
+            F_abm_obj[i] = analytical.evaluate(X_abm[i])
+        if (i + 1) % 10 == 0:
+            elapsed = time.time() - t0
+            eta = elapsed / (i + 1) * (TRMOBO_INIT_SAMPLES - i - 1)
+            logger.info("  ABM sample %d/%d (elapsed: %.1fs, ETA: %.1fs)",
+                        i + 1, TRMOBO_INIT_SAMPLES, elapsed, eta)
+
+    elapsed = time.time() - t0
+    logger.info("  ABM evaluation complete: %d samples in %.1fs",
+                TRMOBO_INIT_SAMPLES, elapsed)
+
+    # Build 13-dim data: intermediates from analytical + objectives from ABM
+    Y_abm_13 = np.zeros((TRMOBO_INIT_SAMPLES, IDX_OBJ_START + 4), dtype=np.float64)
+    for i in range(TRMOBO_INIT_SAMPLES):
+        full_analytical = analytical.evaluate_with_intermediates(X_abm[i])
+        Y_abm_13[i, :IDX_OBJ_START] = full_analytical[:IDX_OBJ_START]  # intermediates
+        Y_abm_13[i, IDX_OBJ_START:] = F_abm_obj[i]  # ABM objectives
+
+    # 2. Finetune ANP on 13-dim ABM data
+    logger.info("  Finetuning ANP on ABM data (13-dim)...")
+    abm_data = {'theta': X_abm, 'y': Y_abm_13}
+    anp_trainer.finetune(
+        abm_data, condition_vec,
+        epochs=ANP_FINETUNE_EPOCHS,
+    )
+
+    # 3. Create predictor and compute residuals (on 4-dim objectives only)
+    predictor = ANPPredictor(
+        anp_model, X_abm, Y_abm_13, condition_vec,
+        normalizer=anp_trainer.normalizer)
+    mu_all, _ = predictor.predict(X_abm)
+    F_predicted_obj = mu_all[:, IDX_OBJ_START:]  # only objective dims
+    residuals = F_abm_obj - F_predicted_obj
+
+    # 4. Fit residual model (on 4-dim residuals)
+    if RESIDUAL_METHOD == 'quadratic':
+        residual_model = QuadraticResidualModel()
+        residual_model.fit(X_abm, residuals)
+        cv_error = residual_model.cross_validate_error()
+        logger.info("  Quadratic residual CV error: %.4f", cv_error)
+        if cv_error > RESIDUAL_SWITCH_THRESHOLD:
+            logger.info("  CV error > %.2f, switching to GP residual",
+                        RESIDUAL_SWITCH_THRESHOLD)
+            residual_model = GPResidualModel()
+            residual_model.fit(X_abm, residuals)
+    else:
+        residual_model = GPResidualModel()
+        residual_model.fit(X_abm, residuals)
+
+    # 5. Create combined surrogate evaluator
+    surrogate = NPSurrogateEvaluator(predictor, residual_model, analytical)
+
+    # 6. Initialize trust regions from ABM objective data
+    tr_manager = MultiTrustRegionManager()
+    tr_manager.initialize_from_data(X_abm, F_abm_obj)
+    logger.info("  Initialized %d trust regions", tr_manager.n_regions)
+
+    context_data = {'theta': X_abm.copy(), 'y': Y_abm_13.copy()}
+
+    logger.info("Phase A complete")
+    return surrogate, tr_manager, context_data, residual_model, X_abm, F_abm_obj
+
+
+# ================================================================== #
+#  Phase B: TR-MOBO Main Loop                                         #
+# ================================================================== #
+
+def _phase_b_trmobo(surrogate, tr_manager, anp_trainer,
+                     residual_model, abm, agents, condition_vec,
+                     context_data, X_all, F_all):
+    """Phase B: TR-MOBO iterative optimization.
+
+    Parameters
+    ----------
+    surrogate : NPSurrogateEvaluator
+    tr_manager : MultiTrustRegionManager
+    anp_trainer : ANPTrainer
+    residual_model : residual model instance
+    abm : callable
+    agents : dict
+    condition_vec : ndarray (96,)
+    context_data : dict
+    X_all : ndarray, all evaluated X so far
+    F_all : ndarray, all evaluated F so far
+
+    Returns
+    -------
+    pareto_X : ndarray
+    pareto_F : ndarray
+    iteration_history : list[dict]
+    X_all : ndarray (n, 17) -- all evaluated theta
+    F_all : ndarray (n, 4) -- all evaluated objectives
+    Y_all_13 : ndarray (n, 13) -- all 13-dim data
+    """
+    logger.info("=" * 60)
+    logger.info("Phase B: TR-MOBO Optimization")
+    logger.info("  Max iterations: %d", TRMOBO_MAX_ITERATIONS)
+    logger.info("  Convergence patience: %d", TRMOBO_CONVERGENCE_PATIENCE)
+    logger.info("=" * 60)
+
+    ref_point = EHVI_REFERENCE_POINT
+    pareto_X, pareto_F = _update_pareto_front(X_all, F_all)
+    hv_current = compute_hypervolume(pareto_F, ref_point)
+
+    # Build initial Y_all_13 from context_data
+    Y_all_13 = context_data['y'].copy()  # (n_init, 13)
+
+    iteration_history = []
+    no_improve_count = 0
+
+    for iteration in range(TRMOBO_MAX_ITERATIONS):
+        t_iter = time.time()
+
+        # 1. Select one candidate per trust region
+        candidates = []
+        predicted_ehvi = []
+        tr_bounds_list = tr_manager.get_all_bounds()
+
+        for r_idx, tr_bounds in enumerate(tr_bounds_list):
+            candidate = maximize_ehvi_in_tr(
+                surrogate.anp, tr_bounds, pareto_F, ref_point,
+                n_candidates=100,  # Reduced for speed
+                n_best=1,
+            )
+            candidates.append(candidate[0])  # (17,)
+
+            # Compute predicted EHVI for this candidate (objectives only)
+            mu_obj, sigma_obj = surrogate.anp.predict_objectives(candidate)
+            ehvi_val = compute_ehvi(mu_obj[0], sigma_obj[0], pareto_F, ref_point)
+            predicted_ehvi.append(ehvi_val)
+
+        candidates = np.array(candidates)  # (n_regions, 17)
+
+        # 2. ABM evaluation of candidates → build 13-dim context entries
+        F_candidates_obj = np.zeros((len(candidates), 4), dtype=np.float64)
+        Y_candidates_13 = np.zeros((len(candidates), IDX_OBJ_START + 4),
+                                    dtype=np.float64)
+        for i in range(len(candidates)):
+            try:
+                F_candidates_obj[i] = abm(candidates[i], agents)
+            except Exception as e:
+                logger.warning("ABM failed at iter %d, TR %d: %s",
+                               iteration, i, e)
+                F_candidates_obj[i], _ = surrogate.evaluate(candidates[i])
+            # Build 13-dim: intermediates from analytical + objectives from ABM
+            full_analytical = surrogate.analytical.evaluate_with_intermediates(
+                candidates[i])
+            Y_candidates_13[i, :IDX_OBJ_START] = full_analytical[:IDX_OBJ_START]
+            Y_candidates_13[i, IDX_OBJ_START:] = F_candidates_obj[i]
+
+        # 3. Update Pareto front and compute HV
+        X_all = np.vstack([X_all, candidates])
+        F_all = np.vstack([F_all, F_candidates_obj])
+        Y_all_13 = np.vstack([Y_all_13, Y_candidates_13])
+        pareto_X, pareto_F = _update_pareto_front(X_all, F_all)
+        hv_new = compute_hypervolume(pareto_F, ref_point)
+        hv_gain = hv_new - hv_current
+
+        # 4. Update trust regions
+        for r_idx in range(len(candidates)):
+            actual_gain = hv_new - hv_current  # Shared gain
+            rho = compute_improvement_ratio(
+                predicted_ehvi[r_idx], actual_gain / max(len(candidates), 1))
+
+            # Update center if this candidate is non-dominated
+            new_center = None
+            if hv_gain > 0:
+                new_center = candidates[r_idx]
+            tr_manager.update_regions(r_idx, rho, new_center)
+
+            # Restart degenerate TRs
+            if tr_manager.regions[r_idx].length <= tr_manager.regions[r_idx].length_min:
+                tr_manager.restart_region(r_idx)
+                logger.info("  Iter %d: Restarted TR %d", iteration, r_idx)
+
+        hv_current = hv_new
+
+        # 5. Add 13-dim context to ANP predictor
+        surrogate.anp.add_context(candidates, Y_candidates_13)
+
+        # 6. Periodic continual finetuning
+        if (iteration + 1) % ANP_CONTINUAL_FINETUNE_EVERY == 0:
+            logger.info("  Iter %d: Finetuning ANP (continual)...", iteration)
+            # Use accumulated Y_all_13 directly (no reconstruction needed)
+            all_data = {'theta': X_all, 'y': Y_all_13}
+            anp_trainer.continual_finetune(
+                all_data, condition_vec,
+                epochs=ANP_CONTINUAL_FINETUNE_EPOCHS,
+            )
+            # Refit residual model from scratch
+            mu_all, _ = surrogate.anp.predict(X_all)
+            F_pred_obj = mu_all[:, IDX_OBJ_START:]
+            residuals_all = F_all - F_pred_obj
+            residual_model.fit(X_all, residuals_all)
+
+        # 7. Record iteration history
+        tr_status = tr_manager.get_status()
+        iter_record = {
+            'iteration': iteration,
+            'hypervolume': hv_current,
+            'hv_gain': hv_gain,
+            'n_pareto': pareto_F.shape[0],
+            'tr_lengths': tr_status['lengths'],
+            'n_abm_evals': X_all.shape[0],
+            'wall_time': time.time() - t_iter,
+        }
+        iteration_history.append(iter_record)
+
+        if (iteration + 1) % 10 == 0 or iteration == 0:
+            logger.info(
+                "  Iter %d/%d: HV=%.6f (+%.6f), Pareto=%d, TRs=%s",
+                iteration + 1, TRMOBO_MAX_ITERATIONS,
+                hv_current, hv_gain, pareto_F.shape[0],
+                [f"{l:.3f}" for l in tr_status['lengths']],
+            )
+
+        # 8. Convergence check
+        if hv_gain < TRMOBO_CONVERGENCE_EPS:
+            no_improve_count += 1
+        else:
+            no_improve_count = 0
+
+        if no_improve_count >= TRMOBO_CONVERGENCE_PATIENCE:
+            logger.info("  Converged at iteration %d (no improvement for %d rounds)",
+                        iteration, TRMOBO_CONVERGENCE_PATIENCE)
+            break
+
+    logger.info("Phase B complete: %d iterations, final HV=%.6f, Pareto=%d",
+                len(iteration_history), hv_current, pareto_F.shape[0])
+
+    return pareto_X, pareto_F, iteration_history, X_all, F_all, Y_all_13
+
+
+# ================================================================== #
+#  Phase C: Pareto Verification                                        #
 # ================================================================== #
 
 def _verify_pareto_front(pareto_X, abm, agents, n_seeds=PARETO_VERIFY_SEEDS):
@@ -315,21 +424,15 @@ def _verify_pareto_front(pareto_X, abm, agents, n_seeds=PARETO_VERIFY_SEEDS):
     Parameters
     ----------
     pareto_X : ndarray[m, 17]
-        Pareto-optimal strategy vectors from NSGA-II.
     abm : callable
-        abm(theta, agents, seed=int) -> ndarray[4]
     agents : dict
     n_seeds : int
-        Number of random seeds per solution.
 
     Returns
     -------
     verified_X : ndarray[m, 17]
-        Pareto solutions (same as input).
     verified_F_mean : ndarray[m, 4]
-        Mean ABM objectives across seeds.
     verified_F_std : ndarray[m, 4]
-        Std of ABM objectives across seeds.
     """
     m = pareto_X.shape[0]
     all_F = np.zeros((m, n_seeds, 4), dtype=np.float64)
@@ -343,7 +446,6 @@ def _verify_pareto_front(pareto_X, abm, agents, n_seeds=PARETO_VERIFY_SEEDS):
             try:
                 all_F[i, s] = abm(pareto_X[i], agents, seed=42 + s)
             except TypeError:
-                # ABM may not accept seed kwarg; run without it
                 all_F[i, s] = abm(pareto_X[i], agents)
             except Exception as e:
                 logger.warning("ABM verification failed: solution %d, seed %d: %s",
@@ -363,62 +465,13 @@ def _verify_pareto_front(pareto_X, abm, agents, n_seeds=PARETO_VERIFY_SEEDS):
     return pareto_X, verified_F_mean, verified_F_std
 
 
-def _extract_pareto_front(result, max_solutions=PARETO_VERIFY_N):
-    """Extract Pareto-optimal solutions from the pymoo result.
-
-    Parameters
-    ----------
-    result : pymoo.core.result.Result
-    max_solutions : int
-        Maximum number of Pareto solutions to return.
-
-    Returns
-    -------
-    pareto_X : ndarray[m, 17]
-    pareto_F : ndarray[m, 4]
-    """
-    # Get non-dominated solutions
-    F = result.F
-    X = result.X
-
-    if F is None or X is None:
-        return np.empty((0, N_THETA)), np.empty((0, 4))
-
-    # Non-dominated sorting (rank 0 only)
-    n = F.shape[0]
-    is_pareto = np.ones(n, dtype=bool)
-    for i in range(n):
-        if not is_pareto[i]:
-            continue
-        for j in range(n):
-            if i == j or not is_pareto[j]:
-                continue
-            if np.all(F[j] <= F[i]) and np.any(F[j] < F[i]):
-                is_pareto[i] = False
-                break
-
-    pareto_X = X[is_pareto]
-    pareto_F = F[is_pareto]
-
-    # Limit to max_solutions (uniform spacing along first objective)
-    if pareto_X.shape[0] > max_solutions:
-        indices = np.linspace(0, pareto_X.shape[0] - 1,
-                              max_solutions, dtype=int)
-        # Sort by first objective for uniform spacing
-        sort_order = np.argsort(pareto_F[:, 0])
-        pareto_X = pareto_X[sort_order][indices]
-        pareto_F = pareto_F[sort_order][indices]
-
-    return pareto_X, pareto_F
-
-
 # ================================================================== #
-#  5. Main Optimisation Pipeline                                       #
+#  Main Optimisation Pipeline                                          #
 # ================================================================== #
 
 def run_optimization(agents, abm, ch3_model, ch1_model, ch2_model,
                      scenario_modifier=None):
-    """Full SBO pipeline: LHS init -> NSGA-II with infill -> Pareto verification.
+    """Full TR-MOBO pipeline: Phase 0 -> A -> B -> C.
 
     Parameters
     ----------
@@ -429,103 +482,77 @@ def run_optimization(agents, abm, ch3_model, ch1_model, ch2_model,
         Signature: abm(theta, agents) -> ndarray[4]
         (or abm(theta, agents, seed=int) for verification phase).
     ch3_model : module
-        Ch3 bundle-choice model.
     ch1_model : module
-        Ch1 trial probability model.
     ch2_model : module
-        Ch2 subscription probability model.
     scenario_modifier : callable, optional
-        Function that modifies agents dict before evaluation,
-        e.g. for policy scenarios. Signature: modifier(agents) -> agents.
 
     Returns
     -------
-    result : pymoo.core.result.Result
-        Raw NSGA-II result object.
+    result_dict : dict
+        {'pareto_X', 'pareto_F', 'n_iterations', 'converged'}
     pareto_X : ndarray[m, 17]
-        Verified Pareto-optimal strategy vectors.
     pareto_F : ndarray[m, 4]
-        Verified mean objective values.
     history : dict
-        Contains 'gp_model', 'lhs_X', 'lhs_F_true', 'lhs_F_analytical',
-        'infill_callback', 'pareto_F_std', 'wall_time'.
+        Contains 'iteration_history', 'hypervolume',
+        'pareto_F_std', 'wall_time'.
     """
     wall_t0 = time.time()
 
-    # Apply scenario modifier if provided (pre-processes agents only)
+    # Apply scenario modifier if provided
     if scenario_modifier is not None:
         agents, _, _ = scenario_modifier(agents, np.zeros(N_THETA), {})
 
     # ============================================================== #
-    # Phase A: Build analytical surrogate and initialise GP via LHS   #
+    # Build analytical surrogate and condition vector                  #
     # ============================================================== #
-    logger.info("=" * 60)
-    logger.info("Phase A: Initialisation")
-    logger.info("=" * 60)
-
     analytical = AnalyticalSurrogate(agents, ch3_model, ch1_model, ch2_model)
-
-    X_lhs = _generate_lhs_samples(n_samples=LHS_SAMPLES)
-    gp_model, F_true_lhs, F_analytical_lhs = _initial_gp_training(
-        X_lhs, abm, agents, analytical)
-
-    surrogate = SurrogateEvaluator(analytical, gp_model)
+    condition_vec = aggregate_condition_vector(agents)
 
     # ============================================================== #
-    # Phase B: NSGA-II with surrogate + infill callbacks              #
+    # Phase 0: Analytical pretraining                                  #
     # ============================================================== #
     logger.info("=" * 60)
-    logger.info("Phase B: NSGA-II Optimisation")
-    logger.info("  Population size: %d", NSGA2_POP_SIZE)
-    logger.info("  Generations: %d", NSGA2_N_GEN)
-    logger.info("  Infill per trigger: %d", INFILL_PER_GEN)
+    logger.info("Phase 0: ANP Pretraining")
     logger.info("=" * 60)
 
-    problem = MaaSSBOProblem(surrogate)
-
-    infill_cb = InfillCallback(
-        abm=abm,
-        agents=agents,
-        analytical=analytical,
-        gp_model=gp_model,
-        n_infill=INFILL_PER_GEN,
-    )
-
-    algorithm = NSGA2(
-        pop_size=NSGA2_POP_SIZE,
-        sampling=LHS(),
-        crossover=SBX(prob=0.9, eta=15),
-        mutation=PM(eta=20),
-        eliminate_duplicates=True,
-    )
-
-    termination = get_termination("n_gen", NSGA2_N_GEN)
-
-    result = minimize(
-        problem,
-        algorithm,
-        termination,
-        callback=infill_cb,
-        seed=42,
-        verbose=True,
-    )
-
-    logger.info("NSGA-II complete: %d evaluations, %d generations",
-                result.algorithm.evaluator.n_eval, result.algorithm.n_gen)
+    anp_model, anp_trainer = _phase0_analytical_pretrain(
+        agents, analytical, condition_vec)
 
     # ============================================================== #
-    # Phase C: Pareto front extraction and ABM verification           #
+    # Phase A: ABM calibration                                         #
+    # ============================================================== #
+    surrogate, tr_manager, context_data, residual_model, X_abm, F_abm = \
+        _phase_a_abm_calibration(
+            anp_model, anp_trainer, analytical,
+            abm, agents, condition_vec)
+
+    # ============================================================== #
+    # Phase B: TR-MOBO main loop                                       #
+    # ============================================================== #
+    pareto_X, pareto_F, iteration_history, X_all, F_all, Y_all_13 = \
+        _phase_b_trmobo(
+            surrogate, tr_manager, anp_trainer,
+            residual_model, abm, agents, condition_vec,
+            context_data, X_abm, F_abm)
+
+    # Limit Pareto solutions for verification
+    if pareto_X.shape[0] > PARETO_VERIFY_N:
+        indices = np.linspace(0, pareto_X.shape[0] - 1,
+                              PARETO_VERIFY_N, dtype=int)
+        sort_order = np.argsort(pareto_F[:, 0])
+        pareto_X = pareto_X[sort_order][indices]
+        pareto_F = pareto_F[sort_order][indices]
+
+    # ============================================================== #
+    # Phase C: Pareto verification                                     #
     # ============================================================== #
     logger.info("=" * 60)
     logger.info("Phase C: Pareto Verification")
     logger.info("=" * 60)
 
-    pareto_X_surrogate, pareto_F_surrogate = _extract_pareto_front(
-        result, max_solutions=PARETO_VERIFY_N)
-
-    if pareto_X_surrogate.shape[0] > 0:
+    if pareto_X.shape[0] > 0:
         pareto_X, pareto_F, pareto_F_std = _verify_pareto_front(
-            pareto_X_surrogate, abm, agents, n_seeds=PARETO_VERIFY_SEEDS)
+            pareto_X, abm, agents, n_seeds=PARETO_VERIFY_SEEDS)
     else:
         logger.warning("No Pareto solutions found; returning empty results.")
         pareto_X = np.empty((0, N_THETA))
@@ -533,28 +560,47 @@ def run_optimization(agents, abm, ch3_model, ch1_model, ch2_model,
         pareto_F_std = np.empty((0, 4))
 
     wall_time = time.time() - wall_t0
+
+    # ============================================================== #
+    # Summary                                                          #
+    # ============================================================== #
+    n_iterations = len(iteration_history)
+    converged = (n_iterations < TRMOBO_MAX_ITERATIONS)
+
     logger.info("=" * 60)
     logger.info("Optimisation pipeline complete.")
     logger.info("  Total wall time: %.1f s (%.1f min)", wall_time, wall_time / 60)
     logger.info("  Pareto solutions verified: %d", pareto_X.shape[0])
-    logger.info("  Total ABM evaluations: %d",
-                LHS_SAMPLES + infill_cb.total_abm_evals
-                + pareto_X.shape[0] * PARETO_VERIFY_SEEDS)
+    logger.info("  Total iterations: %d, Converged: %s", n_iterations, converged)
     logger.info("=" * 60)
 
     # ============================================================== #
-    # Assemble history                                                 #
+    # Assemble results                                                 #
     # ============================================================== #
-    history = {
-        'gp_model': gp_model,
-        'analytical': analytical,
-        'lhs_X': X_lhs,
-        'lhs_F_true': F_true_lhs,
-        'lhs_F_analytical': F_analytical_lhs,
-        'infill_callback': infill_cb,
-        'pareto_F_surrogate': pareto_F_surrogate,
-        'pareto_F_std': pareto_F_std,
-        'wall_time': wall_time,
+    result_dict = {
+        'pareto_X': pareto_X,
+        'pareto_F': pareto_F,
+        'n_iterations': n_iterations,
+        'converged': converged,
     }
 
-    return result, pareto_X, pareto_F, history
+    # Build hypervolume history for visualization
+    hypervolume_history = [rec['hypervolume'] for rec in iteration_history]
+
+    history = {
+        'iteration_history': iteration_history,
+        'hypervolume': hypervolume_history,
+        'analytical': analytical,
+        'anp_model': anp_model,
+        'anp_trainer': anp_trainer,
+        'anp_normalizer': anp_trainer.normalizer,
+        'tr_manager': tr_manager,
+        'residual_model': residual_model,
+        'pareto_F_std': pareto_F_std,
+        'wall_time': wall_time,
+        'X_all': X_all,
+        'F_all': F_all,
+        'Y_all_13': Y_all_13,
+    }
+
+    return result_dict, pareto_X, pareto_F, history

@@ -21,6 +21,13 @@ pytest>=7.0
 # Data I/O
 openpyxl>=3.1
 
+# Deep learning (ANP surrogate)
+torch>=2.0
+
+# Optional: Bayesian optimization utilities (for advanced EHVI)
+# botorch>=0.9
+# gpytorch>=1.10
+
 # Optional: spatial analysis
 # geopandas>=0.13
 # plotly>=5.15

@@ -356,9 +356,9 @@ def plot_convergence(history, save_path=None):
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(gens, hv, color='#2ca02c', linewidth=2.0)
     ax.fill_between(gens, hv.min(), hv, alpha=0.12, color='#2ca02c')
-    ax.set_xlabel('Generation')
+    ax.set_xlabel('Iteration')
     ax.set_ylabel('Hypervolume')
-    ax.set_title('NSGA-II Convergence')
+    ax.set_title('Optimization Convergence')
     ax.grid(True, linestyle='--', alpha=0.4)
 
     # Annotate final HV
@@ -393,3 +393,186 @@ def _save_or_show(fig, save_path):
         print(f"  [viz] Saved: {save_path}")
     else:
         plt.show()
+
+
+# ============================================================
+# 7. TR-MOBO Convergence plot
+# ============================================================
+
+def plot_tr_convergence(iteration_history, save_path=None):
+    """TR-MOBO convergence: hypervolume + TR sizes over iterations.
+
+    Parameters
+    ----------
+    iteration_history : list[dict]
+        Each dict has keys: 'iteration', 'hypervolume', 'tr_lengths', etc.
+    save_path : str or None
+    """
+    if not iteration_history:
+        print("[visualization] No iteration history; skipping TR convergence plot.")
+        return
+
+    iters = [rec['iteration'] for rec in iteration_history]
+    hvs = [rec['hypervolume'] for rec in iteration_history]
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+    # Upper: Hypervolume
+    ax1.plot(iters, hvs, color='#2ca02c', linewidth=2.0)
+    ax1.fill_between(iters, min(hvs) if hvs else 0, hvs,
+                      alpha=0.12, color='#2ca02c')
+    ax1.set_ylabel('Hypervolume')
+    ax1.set_title('TR-MOBO Convergence')
+    ax1.grid(True, linestyle='--', alpha=0.4)
+
+    # Lower: TR lengths
+    n_trs = len(iteration_history[0].get('tr_lengths', []))
+    tr_colors = ['#1f77b4', '#ff7f0e', '#d62728', '#9467bd']
+    for tr_idx in range(n_trs):
+        lengths = [rec.get('tr_lengths', [0] * n_trs)[tr_idx]
+                    for rec in iteration_history]
+        color = tr_colors[tr_idx % len(tr_colors)]
+        ax2.plot(iters, lengths, color=color, linewidth=1.5,
+                 label=f'TR {tr_idx}')
+
+    ax2.set_xlabel('Iteration')
+    ax2.set_ylabel('TR Length')
+    ax2.legend(fontsize=9, loc='best')
+    ax2.grid(True, linestyle='--', alpha=0.4)
+
+    plt.tight_layout()
+    _save_or_show(fig, save_path)
+
+
+# ============================================================
+# 8. NP Uncertainty visualization
+# ============================================================
+
+def plot_np_uncertainty(pareto_X, predictor, save_path=None):
+    """NP uncertainty: predicted mu +/- 2*sigma for Pareto solutions.
+
+    Parameters
+    ----------
+    pareto_X : ndarray (m, 17)
+    predictor : ANPPredictor
+    save_path : str or None
+    """
+    mu, sigma = predictor.predict(pareto_X)
+    m = pareto_X.shape[0]
+
+    obj_names = ['Adoption Rate', 'Net Revenue', 'Gini', 'Carbon Reduction']
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    for idx, (ax, name) in enumerate(zip(axes.flat, obj_names)):
+        x = np.arange(m)
+        ax.errorbar(x, mu[:, idx], yerr=2 * sigma[:, idx],
+                     fmt='o', markersize=3, capsize=2,
+                     color='#1f77b4', ecolor='#ff7f0e', alpha=0.7)
+        ax.set_xlabel('Pareto Solution Index')
+        ax.set_ylabel(name)
+        ax.set_title(f'{name}: mu +/- 2*sigma')
+        ax.grid(True, linestyle='--', alpha=0.3)
+
+    plt.suptitle('ANP Prediction Uncertainty on Pareto Front', fontsize=14)
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    _save_or_show(fig, save_path)
+
+
+# ============================================================
+# 9. Residual analysis plot
+# ============================================================
+
+def plot_residual_analysis(X_eval, F_true, F_predicted, save_path=None):
+    """Residual analysis: true vs predicted scatter + residual distribution.
+
+    Parameters
+    ----------
+    X_eval : ndarray (n, 17)
+        Evaluated parameter vectors (unused but kept for interface).
+    F_true : ndarray (n, 4)
+    F_predicted : ndarray (n, 4)
+    save_path : str or None
+    """
+    residuals = F_true - F_predicted
+    obj_names = ['Adoption', 'Revenue', 'Gini', 'Carbon']
+
+    fig, axes = plt.subplots(2, 4, figsize=(20, 8))
+
+    for idx, name in enumerate(obj_names):
+        # Top: scatter true vs predicted
+        ax_scatter = axes[0, idx]
+        ax_scatter.scatter(F_true[:, idx], F_predicted[:, idx],
+                          s=15, alpha=0.5, color='#1f77b4')
+        lims = [
+            min(F_true[:, idx].min(), F_predicted[:, idx].min()),
+            max(F_true[:, idx].max(), F_predicted[:, idx].max()),
+        ]
+        ax_scatter.plot(lims, lims, 'k--', alpha=0.5, linewidth=1)
+        ax_scatter.set_xlabel(f'True {name}')
+        ax_scatter.set_ylabel(f'Predicted {name}')
+        ax_scatter.set_title(f'{name}: True vs Predicted')
+        ax_scatter.grid(True, linestyle='--', alpha=0.3)
+
+        # Bottom: residual histogram
+        ax_hist = axes[1, idx]
+        ax_hist.hist(residuals[:, idx], bins=30, color='#ff7f0e', alpha=0.7,
+                     edgecolor='black', linewidth=0.5)
+        ax_hist.axvline(0, color='k', linewidth=1)
+        ax_hist.set_xlabel(f'Residual ({name})')
+        ax_hist.set_ylabel('Count')
+        ax_hist.set_title(f'{name}: Residual Distribution')
+
+    plt.suptitle('Residual Analysis: ABM True vs ANP Predicted', fontsize=14)
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    _save_or_show(fig, save_path)
+
+
+# ============================================================
+# 10. TR Status snapshot
+# ============================================================
+
+def plot_tr_status(tr_manager, iteration, save_path=None):
+    """TR status snapshot: centers and radii in 2D PCA projection.
+
+    Parameters
+    ----------
+    tr_manager : MultiTrustRegionManager
+    iteration : int
+    save_path : str or None
+    """
+    from sklearn.decomposition import PCA
+
+    status = tr_manager.get_status()
+    centers = np.array(status['centers'])  # (n_regions, 17)
+    lengths = status['lengths']
+
+    if centers.shape[0] < 2:
+        print("[visualization] Need at least 2 TRs for PCA projection.")
+        return
+
+    # PCA projection to 2D
+    pca = PCA(n_components=2)
+    centers_2d = pca.fit_transform(centers)
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    tr_colors = ['#1f77b4', '#ff7f0e', '#d62728', '#9467bd']
+
+    for i in range(centers.shape[0]):
+        color = tr_colors[i % len(tr_colors)]
+        # Circle radius proportional to TR length
+        circle = plt.Circle(centers_2d[i], lengths[i] * 2,
+                            fill=False, color=color, linewidth=2,
+                            linestyle='--', alpha=0.7)
+        ax.add_patch(circle)
+        ax.plot(centers_2d[i, 0], centers_2d[i, 1], 'o',
+                color=color, markersize=10, label=f'TR {i} (L={lengths[i]:.3f})')
+
+    ax.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.1%})')
+    ax.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.1%})')
+    ax.set_title(f'Trust Region Status (Iteration {iteration})')
+    ax.legend(fontsize=9)
+    ax.set_aspect('equal')
+    ax.grid(True, linestyle='--', alpha=0.3)
+    ax.autoscale()
+
+    _save_or_show(fig, save_path)

@@ -1,14 +1,13 @@
 """
 Surrogate models for fast MaaS ABM objective evaluation.
 
-Two-layer surrogate architecture:
-    1. AnalyticalSurrogate  -- millisecond-level deterministic approximation
+Architecture:
+    1. AnalyticalSurrogate       -- millisecond-level deterministic approximation
        derived from Ch3 (bundle choice), Ch1 (trial probability), and Ch2
        (subscription probability) closed-form models.
-    2. GPResidualModel      -- Gaussian-Process correction that learns the
-       residual between the analytical surrogate and the true ABM output.
-    3. SurrogateEvaluator   -- Combined evaluator that returns objectives
-       together with uncertainty estimates from the GP layer.
+    2. QuadraticResidualModel    -- quadratic polynomial residual correction
+    3. GPResidualModel           -- Gaussian-Process residual (fallback)
+    4. NPSurrogateEvaluator      -- ANP + residual correction combined evaluator
 
 Objective vector (4-dim, all formulated for minimisation):
     [-adoption_rate, -net_revenue, gini_coefficient, -carbon_reduction]
@@ -17,6 +16,9 @@ Objective vector (4-dim, all formulated for minimisation):
 import numpy as np
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, ConstantKernel
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.model_selection import cross_val_score
 
 from config import (
     CH3_PARAMS,
@@ -402,19 +404,253 @@ class AnalyticalSurrogate:
 
         return objectives
 
+    def evaluate_with_intermediates(self, theta):
+        """Evaluate 4 objectives + 9 intermediate physical quantities.
+
+        Returns
+        -------
+        y : ndarray[13]
+            [0] P_aware:            steady-state awareness fraction [0, 1]
+            [1] P_try_mean:         population-mean trial probability [0, 1]
+            [2] P_subscribe_mean:   population-mean subscription probability [0, 1]
+            [3] P_purchase_mean:    population-mean purchase probability [0, 1]
+            [4] max_av_mean:        population-mean max added value
+            [5] E_price_cond:       population-mean expected bundle price
+            [6] mode_shift_factor:  mode shift intensity [0.6, 0.72]
+            [7] adoption_rate:      population adoption rate [0, 1]
+            [8] gini_raw:           Gini coefficient [0, 1]
+            [9:13] objectives:      [-adoption, -revenue, gini, -carbon]
+        """
+        theta = np.asarray(theta, dtype=np.float64)
+        N = self.N
+
+        # 1. Bundle prices
+        prices, prices_arr = _bundle_prices_from_theta(theta)
+
+        # 2. Ch3 utilities
+        V, P_bundle, added_values, max_av = self._compute_ch3_utilities(theta)
+
+        # 3. Awareness
+        P_aware = self._steady_state_awareness(
+            tau_high=theta[6], tau_low=theta[7], B_total=theta[11])
+
+        # 4. Trial probability
+        P_try = self.ch1.compute_trial_probability(self.agents, theta)
+
+        # 5. Subscription probability
+        P_subscribe = self.ch2.compute_subscribe_probability(
+            self.agents, max_av, prices, theta)
+
+        # 6. Adoption
+        P_adopt_agent = P_aware * P_try * P_subscribe
+        adoption_rate = P_adopt_agent.mean()
+
+        # 7. Revenue
+        P_purchase = 1.0 - P_bundle[:, 4]
+        safe_P_purchase = np.maximum(P_purchase, 1e-12)
+        P_cond = P_bundle[:, :4] / safe_P_purchase[:, np.newaxis]
+        expected_price_per_adopter = (P_cond * prices_arr[np.newaxis, :]).sum(axis=1)
+        gross_revenue_per_agent = P_adopt_agent * expected_price_per_adopter
+        total_gross_revenue = gross_revenue_per_agent.sum() * AGENT_WEIGHT
+        marketing_cost = theta[11] * 10000.0 * (N_WEEKS / 4.0)
+        net_revenue = total_gross_revenue * (N_WEEKS / 4.0) - marketing_cost
+
+        # 8. Gini
+        district_adoption = np.zeros(len(self.unique_districts))
+        for idx, d in enumerate(self.unique_districts):
+            mask = self.district == d
+            if mask.sum() > 0:
+                district_adoption[idx] = P_adopt_agent[mask].mean()
+        gini = _gini(district_adoption) if len(district_adoption) > 1 else 0.0
+
+        # 9. Carbon
+        weekly_km = self.travel_distance_day * 5.0
+        car_share = np.clip(self.has_car, 0.0, 1.0)
+        taxi_share = np.clip(self.week_taxi / np.maximum(
+            self.week_bus + self.week_metro + self.week_taxi + 1e-6, 1.0), 0.0, 1.0)
+        pt_share = np.clip(1.0 - car_share - taxi_share, 0.0, 1.0)
+        baseline_co2 = weekly_km * (
+            car_share * CAR_CO2_PER_KM + taxi_share * TAXI_CO2_PER_KM + pt_share * PT_CO2_PER_KM)
+        time_improvement = theta[15]
+        mode_shift_factor = 0.6 + 0.4 * time_improvement
+        post_car_share = car_share * (1.0 - mode_shift_factor * P_adopt_agent)
+        post_taxi_share = taxi_share * (1.0 - 0.3 * mode_shift_factor * P_adopt_agent)
+        post_pt_share = np.clip(1.0 - post_car_share - post_taxi_share, 0.0, 1.0)
+        post_co2 = weekly_km * (
+            post_car_share * CAR_CO2_PER_KM + post_taxi_share * TAXI_CO2_PER_KM + post_pt_share * PT_CO2_PER_KM)
+        carbon_reduction = (baseline_co2 - post_co2).sum() * AGENT_WEIGHT * 52.0 / 1000.0
+
+        # Objectives (minimisation)
+        objectives = np.array([
+            -adoption_rate, -net_revenue, gini, -carbon_reduction
+        ], dtype=np.float64)
+
+        # Intermediates
+        intermediates = np.array([
+            float(P_aware),
+            float(P_try.mean()),
+            float(P_subscribe.mean()),
+            float(P_purchase.mean()),
+            float(max_av.mean()),
+            float(expected_price_per_adopter.mean()),
+            float(mode_shift_factor),
+            float(adoption_rate),
+            float(gini),
+        ], dtype=np.float64)
+
+        return np.concatenate([intermediates, objectives])
+
 
 # ================================================================== #
-#  2. GP Residual Model                                                #
+#  2. Quadratic Residual Model                                         #
+# ================================================================== #
+
+class QuadraticResidualModel:
+    """Quadratic polynomial residual model: delta(theta) = beta_0 + beta_1*theta + beta_2*(theta x theta).
+
+    Uses sklearn Ridge regression with polynomial features (degree 2,
+    including interaction terms).
+    """
+
+    def __init__(self, n_theta=N_THETA, n_objectives=4):
+        self.n_theta = n_theta
+        self.n_objectives = n_objectives
+        self.poly = PolynomialFeatures(degree=2, include_bias=True)
+        self.models = [Ridge(alpha=1.0) for _ in range(n_objectives)]
+        self.fitted = False
+        self.X_train = None
+        self.y_train = None
+        self._residual_std = np.zeros(n_objectives)
+
+    def _build_features(self, X):
+        """Build polynomial feature matrix [1, theta, theta_i*theta_j].
+
+        Parameters
+        ----------
+        X : ndarray (n, 17)
+
+        Returns
+        -------
+        X_poly : ndarray (n, n_features)
+        """
+        return self.poly.fit_transform(X) if not self.fitted else self.poly.transform(X)
+
+    def fit(self, X, residuals):
+        """Fit quadratic models on training data.
+
+        Parameters
+        ----------
+        X : ndarray (n, 17)
+        residuals : ndarray (n, 4)
+            Residuals = ABM_true - NP_predicted.
+        """
+        X = np.asarray(X, dtype=np.float64)
+        residuals = np.asarray(residuals, dtype=np.float64)
+
+        self.X_train = X.copy()
+        self.y_train = residuals.copy()
+
+        X_poly = self.poly.fit_transform(X)
+
+        for i, model in enumerate(self.models):
+            model.fit(X_poly, residuals[:, i])
+
+        # Estimate residual std from training data
+        X_poly_pred = self.poly.transform(X)
+        for i, model in enumerate(self.models):
+            pred = model.predict(X_poly_pred)
+            self._residual_std[i] = np.std(residuals[:, i] - pred)
+
+        self.fitted = True
+
+    def predict(self, X):
+        """Predict residual mean and standard deviation.
+
+        Parameters
+        ----------
+        X : ndarray (n, 17) or (17,)
+
+        Returns
+        -------
+        mean : ndarray (n, 4)
+        std : ndarray (n, 4)
+        """
+        X = np.atleast_2d(np.asarray(X, dtype=np.float64))
+        n = X.shape[0]
+
+        if not self.fitted:
+            return np.zeros((n, 4)), np.zeros((n, 4))
+
+        X_poly = self.poly.transform(X)
+        mean = np.zeros((n, 4), dtype=np.float64)
+        for i, model in enumerate(self.models):
+            mean[:, i] = model.predict(X_poly)
+
+        # Constant std estimate from training residuals
+        std = np.tile(self._residual_std, (n, 1))
+        return mean, std
+
+    def update(self, X_new, residuals_new):
+        """Append new data and refit.
+
+        Parameters
+        ----------
+        X_new : ndarray (m, 17)
+        residuals_new : ndarray (m, 4)
+        """
+        X_new = np.atleast_2d(np.asarray(X_new, dtype=np.float64))
+        residuals_new = np.atleast_2d(np.asarray(residuals_new, dtype=np.float64))
+
+        if self.X_train is not None:
+            self.X_train = np.vstack([self.X_train, X_new])
+            self.y_train = np.vstack([self.y_train, residuals_new])
+        else:
+            self.X_train = X_new.copy()
+            self.y_train = residuals_new.copy()
+
+        self.fitted = False  # Reset so _build_features re-fits poly
+        self.fit(self.X_train, self.y_train)
+
+    def cross_validate_error(self):
+        """5-fold cross-validation MAPE.
+
+        Returns
+        -------
+        float
+            Mean CV MAPE across objectives.
+        """
+        if self.X_train is None or self.X_train.shape[0] < 10:
+            return 1.0  # Not enough data
+
+        X_poly = self.poly.transform(self.X_train)
+        cv_errors = []
+        n_folds = min(5, self.X_train.shape[0])
+
+        for i, model in enumerate(self.models):
+            scores = cross_val_score(
+                Ridge(alpha=1.0), X_poly, self.y_train[:, i],
+                cv=n_folds, scoring='neg_mean_absolute_error')
+            y_scale = np.abs(self.y_train[:, i]).mean()
+            if y_scale > 1e-12:
+                cv_errors.append(-scores.mean() / y_scale)
+            else:
+                cv_errors.append(0.0)
+
+        return float(np.mean(cv_errors))
+
+
+# ================================================================== #
+#  3. GP Residual Model (fallback)                                     #
 # ================================================================== #
 
 class GPResidualModel:
     """Four independent Gaussian Process regressors for residual correction.
 
     The residual is defined as:
-        residual = ABM_true_objectives - analytical_surrogate_objectives
+        residual = ABM_true_objectives - NP_predicted_objectives
 
     so that:
-        corrected = analytical + GP_predict(residual)
+        corrected = NP_predicted + GP_predict(residual)
 
     Each of the 4 objectives gets its own GP with a Matern-5/2 kernel.
     """
@@ -445,7 +681,7 @@ class GPResidualModel:
         X : ndarray[n, 17]
             Strategy parameter vectors.
         residuals : ndarray[n, 4]
-            Residuals (ABM_true - analytical) for each objective.
+            Residuals (ABM_true - NP_predicted) for each objective.
         """
         X = np.asarray(X, dtype=np.float64)
         residuals = np.asarray(residuals, dtype=np.float64)
@@ -464,14 +700,11 @@ class GPResidualModel:
         Parameters
         ----------
         X : ndarray[n, 17] or ndarray[17]
-            Query points.
 
         Returns
         -------
         mean : ndarray[n, 4]
-            Predicted residual means.
         std : ndarray[n, 4]
-            Predicted residual standard deviations.
         """
         X = np.atleast_2d(np.asarray(X, dtype=np.float64))
         n = X.shape[0]
@@ -479,7 +712,6 @@ class GPResidualModel:
         std = np.zeros((n, 4), dtype=np.float64)
 
         if not self.fitted:
-            # Return zeros before any training data is available
             return mean, std
 
         for i, gp in enumerate(self.gps):
@@ -492,14 +724,10 @@ class GPResidualModel:
     def update(self, X_new, residuals_new):
         """Incrementally update GPs with new observations.
 
-        Appends new data to the existing training set and refits all GPs.
-
         Parameters
         ----------
         X_new : ndarray[m, 17]
-            New strategy parameter vectors.
         residuals_new : ndarray[m, 4]
-            Corresponding new residuals.
         """
         X_new = np.asarray(X_new, dtype=np.float64)
         residuals_new = np.asarray(residuals_new, dtype=np.float64)
@@ -516,7 +744,6 @@ class GPResidualModel:
             self.X_train = X_new.copy()
             self.y_train = residuals_new.copy()
 
-        # Refit all GPs with augmented data
         for i, gp in enumerate(self.gps):
             gp.fit(self.X_train, self.y_train[:, i])
 
@@ -529,27 +756,29 @@ class GPResidualModel:
 
 
 # ================================================================== #
-#  3. Combined Surrogate Evaluator                                     #
+#  4. NP Surrogate Evaluator                                           #
 # ================================================================== #
 
-class SurrogateEvaluator:
-    """Combined evaluator: analytical surrogate + GP residual correction.
+class NPSurrogateEvaluator:
+    """Combined evaluator: ANP + residual correction.
 
-    Provides both the corrected objective estimates and uncertainty
-    quantification from the GP posterior.
+    Provides corrected objective estimates and uncertainty from the ANP.
     """
 
-    def __init__(self, analytical, gp_model):
+    def __init__(self, anp_predictor, residual_model, analytical=None):
         """
         Parameters
         ----------
-        analytical : AnalyticalSurrogate
-            Pre-initialised analytical surrogate.
-        gp_model : GPResidualModel
-            GP residual model (may or may not be fitted yet).
+        anp_predictor : ANPPredictor
+            ANP inference interface.
+        residual_model : QuadraticResidualModel or GPResidualModel
+            Residual correction model.
+        analytical : AnalyticalSurrogate, optional
+            Only used in Phase 0 before ANP is available.
         """
+        self.anp = anp_predictor
+        self.residual = residual_model
         self.analytical = analytical
-        self.gp = gp_model
 
     def evaluate(self, theta):
         """Evaluate corrected objectives with uncertainty.
@@ -557,58 +786,57 @@ class SurrogateEvaluator:
         Parameters
         ----------
         theta : ndarray[17]
-            Strategy parameter vector.
 
         Returns
         -------
         objectives : ndarray[4]
-            Corrected objective values (analytical + GP mean residual).
+            Corrected: mu_NP_obj + delta_residual.
         uncertainty : ndarray[4]
-            GP posterior standard deviation for each objective
-            (zero if GP not yet fitted).
+            sigma_NP_obj.
         """
         theta = np.asarray(theta, dtype=np.float64)
 
-        # Analytical baseline
-        f_analytical = self.analytical.evaluate(theta)
+        # ANP prediction (objectives only, 4-dim)
+        mu_obj, sigma_obj = self.anp.predict_objectives(theta.reshape(1, -1))
+        mu_obj = mu_obj.flatten()        # (4,)
+        sigma_obj = sigma_obj.flatten()  # (4,)
 
-        # GP residual correction
-        gp_mean, gp_std = self.gp.predict(theta.reshape(1, -1))
-        gp_mean = gp_mean.flatten()  # (4,)
-        gp_std = gp_std.flatten()    # (4,)
+        # Residual correction
+        delta_mean, _ = self.residual.predict(theta.reshape(1, -1))
+        delta_mean = delta_mean.flatten()  # (4,)
 
-        objectives = f_analytical + gp_mean
-        uncertainty = gp_std
+        objectives = mu_obj + delta_mean
+        uncertainty = sigma_obj
 
         return objectives, uncertainty
 
     def evaluate_batch(self, X):
-        """Batch evaluation for a population matrix.
+        """Batch evaluation.
 
         Parameters
         ----------
-        X : ndarray[pop_size, 17]
-            Matrix of strategy vectors.
+        X : ndarray[n, 17]
 
         Returns
         -------
-        F : ndarray[pop_size, 4]
+        F : ndarray[n, 4]
             Corrected objectives.
-        U : ndarray[pop_size, 4]
+        U : ndarray[n, 4]
             Uncertainties.
         """
         X = np.atleast_2d(np.asarray(X, dtype=np.float64))
-        pop_size = X.shape[0]
 
-        # Analytical evaluations (vectorisation over population)
-        F_analytical = np.zeros((pop_size, 4), dtype=np.float64)
-        for i in range(pop_size):
-            F_analytical[i] = self.analytical.evaluate(X[i])
+        # ANP batch prediction (objectives only, 4-dim)
+        mu_obj, sigma_obj = self.anp.predict_objectives(X)
 
-        # GP residual correction (batch)
-        gp_mean, gp_std = self.gp.predict(X)
+        # Residual correction
+        delta_mean, _ = self.residual.predict(X)
 
-        F = F_analytical + gp_mean
-        U = gp_std
+        F = mu_obj + delta_mean
+        U = sigma_obj
 
         return F, U
+
+
+# Backward-compatible alias
+SurrogateEvaluator = NPSurrogateEvaluator

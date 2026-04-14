@@ -347,3 +347,78 @@ OBJ_ADOPTION = 0           # Maximize adoption rate (negated for minimization)
 OBJ_REVENUE = 1            # Maximize net revenue (negated)
 OBJ_EQUITY = 2             # Minimize Gini coefficient of adoption across districts
 OBJ_CARBON = 3             # Maximize carbon reduction (negated)
+
+# ============================================================
+# I. ANP Configuration
+# ============================================================
+ANP_THETA_DIM = N_THETA          # 17
+ANP_Y_DIM = 13                   # 9 intermediates + 4 objectives
+ANP_COND_DIM = 96                # 16 districts × 6 features
+ANP_COND_EMBED_DIM = 16
+ANP_ENCODER_HIDDEN = [64, 64]
+ANP_DECODER_HIDDEN = [128, 64]
+ANP_LATENT_DIM = 32
+ANP_ATTENTION_HEADS = 4
+ANP_DET_OUTPUT_DIM = 64
+ANP_PRETRAIN_EPOCHS = 100        # Phase 0: analytical pretraining
+ANP_PRETRAIN_LR = 1e-3
+ANP_PRETRAIN_SAMPLES = 5000      # LHS samples for analytical pretraining
+ANP_FINETUNE_EPOCHS = 300        # Phase A: ABM calibration
+ANP_FINETUNE_LR = 2e-3
+ANP_CONTINUAL_FINETUNE_EVERY = 5   # Phase B: finetune every 5 iterations
+ANP_CONTINUAL_FINETUNE_EPOCHS = 50
+ANP_EWC_LAMBDA = 0.0             # EWC regularization strength
+ANP_CONTINUAL_LR = 5e-4
+
+# ============================================================
+# J. Trust Region Configuration
+# ============================================================
+TR_N_REGIONS = 4
+TR_LENGTH_INIT = 0.8             # Normalized initial TR length
+TR_LENGTH_MIN = 0.01
+TR_LENGTH_MAX = 1.6
+TR_EXPAND_FACTOR = 2.0
+TR_SHRINK_FACTOR = 0.5
+TR_EXPAND_THRESHOLD = 0.75       # rho > 0.75 -> expand
+TR_SHRINK_THRESHOLD = 0.25       # rho < 0.25 -> shrink
+
+# ============================================================
+# K. EHVI Configuration
+# ============================================================
+EHVI_MC_SAMPLES = 128
+EHVI_REFERENCE_POINT = np.array([0.1, 1e8, 1.0, 0.1])  # HV reference point (worst-case for minimization)
+EHVI_CANDIDATES_PER_TR = 1000    # LHS candidates per trust region
+
+# ============================================================
+# L. TR-MOBO Optimization Budget
+# ============================================================
+TRMOBO_INIT_SAMPLES = 50         # Phase A ABM evaluations
+TRMOBO_MAX_ITERATIONS = 200      # Phase B max iterations
+TRMOBO_CONVERGENCE_PATIENCE = 10 # Consecutive no-improvement rounds -> early stop
+TRMOBO_CONVERGENCE_EPS = 1e-4    # HV improvement threshold
+
+# Residual model
+RESIDUAL_METHOD = 'quadratic'    # 'quadratic' or 'gp'
+RESIDUAL_SWITCH_THRESHOLD = 0.05 # CV residual > 5% switches to GP
+
+# ============================================================
+# M. Multi-task Intermediate Quantity Indices
+# ============================================================
+# The 13-dim y vector layout: [9 intermediates, 4 objectives]
+IDX_P_AWARE = 0          # Awareness rate (Bass steady-state)
+IDX_P_TRY = 1            # Mean trial probability
+IDX_P_SUBSCRIBE = 2      # Mean subscription probability
+IDX_P_PURCHASE = 3       # Mean purchase probability (1 - P_nopurchase)
+IDX_MAX_AV = 4           # Mean max added value
+IDX_E_PRICE = 5          # Mean expected bundle price (conditional)
+IDX_MODE_SHIFT = 6       # Mode shift factor
+IDX_ADOPT_RATE = 7       # Adoption rate (scalar)
+IDX_GINI_RAW = 8         # Gini coefficient (raw, before negation)
+IDX_OBJ_START = 9        # Objectives start at index 9
+N_INTERMEDIATES = 9       # Number of intermediate quantities
+N_TOTAL_Y = 13            # Total output dimension (9 + 4)
+
+# Multi-task loss weights
+MULTITASK_W_INTERMEDIATE = 1.0   # Weight for intermediate quantity loss
+MULTITASK_W_OBJECTIVE = 0.5      # Weight for final objective loss
+MULTITASK_W_KL = 0.1             # Weight for KL divergence
