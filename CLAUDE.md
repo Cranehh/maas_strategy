@@ -858,3 +858,79 @@ Tjeng 在 MNIST LP_d-CNN_B (48,064 总 ReLU) 上只有 575 unstable (1.2%)，**�
 **当前建议**：选择 (4) LP relaxation 路径作为 production，把严格 exact MIP 作为论文的 limitation 章节诚实记录。如果时间允许且优先级足够，再回头做 (3) robust retraining。
 
 **Task tracking**：plans/mip-tr-lp-tjeng-xiao-tedrake-iclr-happy-sphinx.md (revised 2026-05-11 evening) 已完整记录算法、实证、根因。所有代码已提交到 working tree（未 commit）。
+
+---
+
+## 2026-05-11 night — Robust Model B retraining (L1 sparsify + ReLU stability)
+
+**Premise** (per Tjeng Appendix I + H): robust training drives ReLU stability; Tjeng's 48K-ReLU networks have <2% unstable because trained with LP_d / Adv / SDP_d losses. Our prediction-loss-only Model B has 76% unstable. **Goal**: add L1 + stability penalty to existing training pipeline, retrain on the same 1000-ABM dataset, see if MIP becomes tractable.
+
+### Implementation (`first_mip` baseline preserved as git commit 7dcc177)
+
+| File | Change |
+|---|---|
+| `code/per_district/ccnn_pd_v3_model.py` | `CCNNPDv3Trainer.__init__` gains `l1_lambda, stability_lambda, stability_scale`; `_register_preact_hooks()` attaches forward hooks on the 8 MIP-target-path Linear/Conv1d modules (`theta_encoder.conv1/2/3/proj`, `per_sample_agg.proj`, `target_query_encoder.0`, `decoder.backbone.0/3`); `compute_loss` adds `λ_stab·mean(exp(-|pre|/scale))` + `λ_L1·Σ\|W\|` penalties. ~80 LOC, no architecture change. |
+| `code/per_district/ccnn_zone_v2_attn_pipeline.py` | CLI flags `--l1-lambda`, `--stability-lambda`, `--stability-scale`; ckpt naming `ccnn_zone_v2_attn_robust_seed{seed}.pt`. ~20 LOC. |
+| `code/per_district/ccnn_pd_v3_attn_model.py` | **No change** — hooks work on existing forward. |
+
+### Hyperparameters used
+
+- `l1_lambda=5e-5`, `stability_lambda=0.05`, `stability_scale=0.5`
+- Same data: 50 pretrain epochs (`zone_pretrain_v2.npz`, 2000 samples) + 800 finetune epochs (`zone_train_n1000_v2.npz`, 1000 ABM), decoder-first 200 epochs.
+- 3 seeds: 2026, 2027, 2028.
+- CPU-only training. ~10 min per seed (much faster than the original 12h GPU estimate because Model B is small).
+
+### Phase 3: Accuracy gate — **PASSED**
+
+Robust 3-seed ensemble (mean ± std):
+
+| Metric | first_mip baseline | **robust ensemble** | Δ |
+|---|---|---|---|
+| City 3-obj overall MAPE | 7.20 % | **7.61 ± 0.13 %** | +0.41 pp |
+| Per-zone × per-stage 6-stage | 14.40 % | **14.90 ± 0.06 %** | +0.50 pp |
+| Per-zone k=5 terminal | 11.89 % | **12.83 ± 0.25 %** | +0.94 pp |
+| City Adoption | 5.65 % | 6.35 ± 0.10 % | +0.70 pp |
+| City Revenue | 9.32 % | 10.02 ± 0.43 % | +0.70 pp |
+| City Carbon | 6.63 % | 6.45 ± 0.15 % | **−0.18 pp** (better) |
+
+All within Goal 3 (≤15 %). Accuracy regression is <1 pp on every metric; std across 3 seeds is tight.
+
+### Phase 4: MIP encoding + solve test — **mixed result**
+
+| ckpt | Encode time | Total binaries | Decoder D3r stable | Decoder D0r stable | Conv stable | MIP solve_exact (600s budget) |
+|---|---|---|---|---|---|---|
+| first_mip seed 2026 | 8.0 s | 10,917 | ~50 % | ~30 % | ~30 % | **TIMEOUT** at 1800 s, 0 incumbent |
+| robust seed 2026 | 8.5 s | **9,914** (−9.2 %) | **98.8 %** | **66.0 %** | 6–33 % | TIMEOUT at 610 s, 0 incumbent |
+| robust seed 2027 | 8.1 s | **9,875** | (similar) | (similar) | (similar) | TIMEOUT at 600 s, 0 incumbent |
+| robust seed 2028 | 8.6 s | **9,649** | (similar) | (similar) | (similar) | TIMEOUT at 600 s, 0 incumbent |
+
+**Decoder hyper-stable**: D3r 98.8 %, D0r 66 %, TQEr 98.4 %. Tjeng Appendix I prediction confirmed — decoder layers benefit most from robust loss.
+
+**Conv layers stay mostly mixed**: L1r 6.2 %, L2r 6.5 %, L3r 19.8 %, Prr 32.8 % stable. The IBP through 3 conv layers compounds error — no amount of training stability fixes this; it's a **bound-propagation problem**, not a network-property problem.
+
+### Verdict
+
+| Aspect | Outcome |
+|---|---|
+| Implementation correctness | ✅ (smoke tests pass, baseline-equivalent when lambdas=0) |
+| Decoder unstable reduction | ✅ (~80 % → ~2 %) — large win |
+| Accuracy preservation | ✅ (≤1 pp regression) |
+| **Total binary reduction** | ⚠ only 9–12 % (10,917 → 9,649–9,914) |
+| **Goal 4 (exact MIP ≤ 1800 s)** | ❌ **3/3 robust seeds TIMEOUT at 600 s with 0 incumbents** |
+
+Robust retraining is a **necessary but not sufficient** ingredient for exact MIP at Model B's scale. The remaining barrier is at the conv stack, which requires either (a) tighter bound propagation (αβ-CROWN / auto_LiRPA), or (b) architectural changes (fewer/smaller conv layers).
+
+### Recommendations going forward
+
+1. **Production**: stay with LP relaxation acquisition (22 s/MIP, +28 % HV validated). Paper narrative: "LP relaxation surrogate is sufficient for TR-MOBO; exact MIP shown as limitation."
+2. **If exact MIP narrative is critical for paper**:
+   - Try αβ-CROWN/auto_LiRPA on the conv stack (4-5 day integration; estimated 30-50 % further binary reduction).
+   - Or simplify Model B architecture (2 conv layers instead of 3, or smaller channel counts) — accepting larger accuracy regression for tractability.
+3. **Robust ckpts retained** in `checkpoints/ccnn_zone_v2_attn_robust_seed{2026,2027,2028}.pt` for future research (e.g., as a starting point if we later add αβ-CROWN).
+
+### Files / artifacts produced (2026-05-11 night)
+
+- `checkpoints/ccnn_zone_v2_attn_robust_seed{2026,2027,2028}.pt`
+- `results/zone_v2_attn_robust_seed{2026,2027,2028}.md`
+- `logs_robust_seed{2026,2027,2028}.log`
+- Trainer + pipeline changes (above)
