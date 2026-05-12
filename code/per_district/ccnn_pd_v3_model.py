@@ -134,6 +134,65 @@ class ThetaEncoder1DCNN_Shared(nn.Module):
         return x.reshape(B, M, D, -1)  # (B, M, D, embed_dim)
 
 
+# -------------------------------------------------------------------
+# Differentiable IBP through the conv stack (for box-robust training).
+# Interval arithmetic: an affine op y = Wx + b on a box [l, u] maps to
+#   l' = W⁺l + W⁻u + b ,  u' = W⁺u + W⁻l + b
+# (W⁺ = max(W,0), W⁻ = min(W,0)); ReLU on a box [l, u] → [relu(l), relu(u)].
+# -------------------------------------------------------------------
+def _conv1d_ibp(conv: nn.Conv1d, lo, hi):
+    Wp = conv.weight.clamp(min=0.0)
+    Wn = conv.weight.clamp(max=0.0)
+    b = conv.bias
+    pad = conv.padding[0] if isinstance(conv.padding, tuple) else conv.padding
+    lo2 = F.conv1d(lo, Wp, b, padding=pad) + F.conv1d(hi, Wn, None, padding=pad)
+    hi2 = F.conv1d(hi, Wp, b, padding=pad) + F.conv1d(lo, Wn, None, padding=pad)
+    return lo2, hi2
+
+
+def _linear_ibp(lin: nn.Linear, lo, hi):
+    Wp = lin.weight.clamp(min=0.0)
+    Wn = lin.weight.clamp(max=0.0)
+    b = lin.bias
+    lo2 = lo @ Wp.t() + hi @ Wn.t() + b
+    hi2 = hi @ Wp.t() + lo @ Wn.t() + b
+    return lo2, hi2
+
+
+def ibp_conv_stack(theta_encoder: 'ThetaEncoder1DCNN_Shared', x_lo, x_hi):
+    """Differentiable IBP through conv1→relu→conv2→relu→conv3→relu→proj→relu.
+
+    Parameters
+    ----------
+    theta_encoder : ThetaEncoder1DCNN_Shared
+    x_lo, x_hi : (B', C=12, K) interval bounds on the (normalized) θ sequence,
+        in the SAME layout the encoder feeds conv1 (permute(...,3,4,2)).
+
+    Returns
+    -------
+    list of (l, u) tensors — one per ReLU pre-activation layer:
+        [(l_conv1, u_conv1), (l_conv2, u_conv2), (l_conv3, u_conv3),
+         (l_proj, u_proj)].
+    Each l/u has shape matching that layer's output (channels×K for conv,
+    embed_dim for proj).
+    """
+    out = []
+    l1, u1 = _conv1d_ibp(theta_encoder.conv1, x_lo, x_hi)
+    out.append((l1, u1))
+    l1r, u1r = l1.clamp(min=0.0), u1.clamp(min=0.0)
+    l2, u2 = _conv1d_ibp(theta_encoder.conv2, l1r, u1r)
+    out.append((l2, u2))
+    l2r, u2r = l2.clamp(min=0.0), u2.clamp(min=0.0)
+    l3, u3 = _conv1d_ibp(theta_encoder.conv3, l2r, u2r)
+    out.append((l3, u3))
+    l3r, u3r = l3.clamp(min=0.0), u3.clamp(min=0.0)
+    lf = l3r.reshape(l3r.shape[0], -1)
+    uf = u3r.reshape(u3r.shape[0], -1)
+    lp, up = _linear_ibp(theta_encoder.proj, lf, uf)
+    out.append((lp, up))
+    return out
+
+
 # ===================================================================
 # 3. Y embedding (same as v2)
 # ===================================================================
@@ -366,7 +425,8 @@ MIP_RELU_PRE_MODULES = (
 
 class CCNNPDv3Trainer:
     def __init__(self, model, normalizer, lr=1e-3, device='cpu', weight_decay=0.0,
-                 l1_lambda=0.0, stability_lambda=0.0, stability_scale=0.5):
+                 l1_lambda=0.0, stability_lambda=0.0, stability_scale=0.5,
+                 box_stability_lambda=0.0, box_delta=0.1):
         """
         Parameters
         ----------
@@ -378,11 +438,21 @@ class CCNNPDv3Trainer:
         stability_lambda : float, default 0.0
             Coefficient on mean(exp(-|x| / stability_scale)) over ReLU
             pre-activations in the MIP target path. Penalizes pre-activations
-            near 0 — encourages one-sided ReLUs across the TR, so post-IA
-            bounds put each unit's (l, u) firmly on one side of 0.
+            near 0 (the POINT VALUE) — a weak proxy for one-sidedness.
         stability_scale : float, default 0.5
-            Scale of the exp(-|x|/scale) kernel. In normalized activation
-            space; 0.5 means penalty kicks in significantly when |x| < ~1.
+            Scale of the exp(-|x|/scale) kernel.
+        box_stability_lambda : float, default 0.0
+            Coefficient on the CERTIFIED box-stability penalty
+            mean(relu(-l)·relu(u)) over the conv-stack ReLU pre-activations,
+            where (l, u) are IBP-propagated bounds over a box
+            [θ_n − box_delta, θ_n + box_delta] around each training θ. This is
+            the proper "robust training" that Tjeng's networks have: it forces
+            the pre-activation INTERVAL (not just the point) to one side of 0,
+            which directly reduces mixed binaries in the MIP. Targets the conv
+            stack (conv1/conv2/conv3/proj) where ~85% of binaries live.
+        box_delta : float, default 0.1
+            Half-width of the box (in normalized [0,1] θ space). 0.1 = a
+            20%-wide box, matching the MIP encoding TR width.
         """
         self.model = model.to(device)
         self.normalizer = normalizer
@@ -392,6 +462,8 @@ class CCNNPDv3Trainer:
         self.l1_lambda = float(l1_lambda)
         self.stability_lambda = float(stability_lambda)
         self.stability_scale = float(stability_scale)
+        self.box_stability_lambda = float(box_stability_lambda)
+        self.box_delta = float(box_delta)
         self.optimizer = torch.optim.AdamW(
             model.parameters(), lr=lr, weight_decay=weight_decay)
         # Hooks on MIP-relevant Linear/Conv1d modules (only when enabled)
@@ -435,8 +507,37 @@ class CCNNPDv3Trainer:
         cos_factor = 0.5 * (1.0 + np.cos(np.pi * progress))
         return base_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * cos_factor)
 
+    def _box_stability_penalty(self, target_theta_n):
+        """Certified IBP box-stability penalty over the conv stack.
+
+        target_theta_n : (B, M, K, D, 12) normalized θ in [0,1].
+
+        For each conv-stack ReLU pre-activation with IBP bounds (l, u) over the
+        box [θ_n − δ, θ_n + δ], the unit is "mixed" iff l < 0 < u. We penalize
+        the *normalized stability margin*:
+            m = min(relu(-l), relu(u)) / (u - l + eps)   ∈ [0, 0.5]
+        — 0 if the unit is stable (one of l≥0 or u≤0), 0.5 if the interval is
+        symmetric around 0. Dimensionless ⇒ well-calibrated regardless of
+        layer scale. Returns the mean over all units of all 4 conv-stack ReLU
+        layers (conv1, conv2, conv3, proj).
+        """
+        lo = (target_theta_n - self.box_delta).clamp(0.0, 1.0)
+        hi = (target_theta_n + self.box_delta).clamp(0.0, 1.0)
+        B, M, K, D, C = lo.shape
+        # Match ThetaEncoder1DCNN_Shared.forward layout: permute(0,1,3,4,2) → (B,M,D,C,K) → reshape (B*M*D, C, K)
+        x_lo = lo.permute(0, 1, 3, 4, 2).reshape(B * M * D, C, K)
+        x_hi = hi.permute(0, 1, 3, 4, 2).reshape(B * M * D, C, K)
+        ibp_layers = ibp_conv_stack(self.model.theta_encoder, x_lo, x_hi)
+        terms = []
+        for (l, u) in ibp_layers:
+            margin = torch.minimum(F.relu(-l), F.relu(u))      # > 0 only if mixed
+            width = (u - l).clamp(min=1e-6)
+            terms.append((margin / width).mean())
+        return torch.stack(terms).mean()
+
     def compute_loss(self, output, target_y_norm,
-                     w_inter=1.0, w_obj=0.5, w_kl=0.1):
+                     w_inter=1.0, w_obj=0.5, w_kl=0.1,
+                     target_theta_n=None):
         mu = output['mu']
         sigma = output['sigma']
         nll = (0.5 * torch.log(sigma ** 2 + 1e-8)
@@ -490,6 +591,11 @@ class CCNNPDv3Trainer:
                 l1 = torch.stack(l1_terms).sum()
                 total = total + self.l1_lambda * l1
 
+        # --- Certified box-stability (the proper Tjeng robust-training term) ---
+        if self.box_stability_lambda > 0 and target_theta_n is not None:
+            box_pen = self._box_stability_penalty(target_theta_n)
+            total = total + self.box_stability_lambda * box_pen
+
         return total
 
     def _to_tensor(self, theta_pd_np, y_pd_np):
@@ -528,7 +634,8 @@ class CCNNPDv3Trainer:
                 tgt_theta = bt[tgt_idx].unsqueeze(0)
                 tgt_y = by[tgt_idx].unsqueeze(0)
                 out = self.model(ctx_theta, ctx_y, tgt_theta, cond, target_y_pd=tgt_y)
-                loss = self.compute_loss(out, tgt_y, w_inter=w_inter, w_obj=w_obj, w_kl=w_kl)
+                loss = self.compute_loss(out, tgt_y, w_inter=w_inter, w_obj=w_obj, w_kl=w_kl,
+                                          target_theta_n=tgt_theta)
                 self.optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
@@ -579,7 +686,8 @@ class CCNNPDv3Trainer:
             tgt_y = y_all.unsqueeze(0)
 
             out = self.model(ctx_theta, ctx_y, tgt_theta, cond, target_y_pd=tgt_y)
-            loss = self.compute_loss(out, tgt_y, w_inter=w_inter, w_obj=w_obj, w_kl=w_kl)
+            loss = self.compute_loss(out, tgt_y, w_inter=w_inter, w_obj=w_obj, w_kl=w_kl,
+                                      target_theta_n=tgt_theta)
             self.optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)

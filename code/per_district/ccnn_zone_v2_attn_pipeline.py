@@ -105,7 +105,8 @@ def train_and_eval(pretrain_path, train_path, test_path,
                    decoder_first_epochs=200, seed=2026,
                    decoder_dropout=0.05,
                    l1_lambda=0.0, stability_lambda=0.0,
-                   stability_scale=0.5):
+                   stability_scale=0.5,
+                   box_stability_lambda=0.0, box_delta=0.1):
     print(f"[CC-CNN-Zone v2-attn (3-obj + cross-zone attn)] seed={seed}")
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -174,14 +175,16 @@ def train_and_eval(pretrain_path, train_path, test_path,
         D=Z, y_dim=Y_DIM, idx_obj_start=IDX_OBJ_START, K=K,
         decoder_dropout=decoder_dropout)
     print(f"  parameters: {model.num_parameters():,}")
-    if l1_lambda > 0 or stability_lambda > 0:
+    if l1_lambda > 0 or stability_lambda > 0 or box_stability_lambda > 0:
         print(f"  robust-train: l1_lambda={l1_lambda:.1e}, "
-              f"stability_lambda={stability_lambda:.1e}, "
-              f"stability_scale={stability_scale}")
+              f"stability_lambda={stability_lambda:.1e}, stability_scale={stability_scale}, "
+              f"box_stability_lambda={box_stability_lambda:.2f}, box_delta={box_delta}")
     trainer = CCNNPDv3Trainer(model, normalizer, lr=1e-3, device=device,
                                 l1_lambda=l1_lambda,
                                 stability_lambda=stability_lambda,
-                                stability_scale=stability_scale)
+                                stability_scale=stability_scale,
+                                box_stability_lambda=box_stability_lambda,
+                                box_delta=box_delta)
 
     obj_scale = (N_STAGE_OBJ * Z) / 3.0  # = 6 × Z = 30
     w_obj_pretrain = 0.5 * obj_scale
@@ -335,6 +338,14 @@ def main():
                          'Recommended 0.05 for robust retraining; 0 = disabled.')
     p.add_argument('--stability-scale', type=float, default=0.5,
                     help='Scale of the exp(-|x|/scale) kernel (normalized activation space).')
+    # Certified box-stability (the proper Tjeng robust-training term) — 2026-05-12
+    p.add_argument('--box-stability-lambda', type=float, default=0.0,
+                    help='Coefficient on the IBP-bound box-stability penalty over the '
+                         'conv stack: mean(min(relu(-l),relu(u))/(u-l)) ∈ [0,0.5]. '
+                         'Recommended 2.0 for box-robust retraining; 0 = disabled.')
+    p.add_argument('--box-delta', type=float, default=0.1,
+                    help='Half-width of the IBP box in normalized [0,1] θ space '
+                         '(0.1 = 20%% box width, matches the MIP encoding TR width).')
     args = ap.parse_args()
 
     if args.cmd == 'train-eval':
@@ -349,6 +360,8 @@ def main():
             l1_lambda=args.l1_lambda,
             stability_lambda=args.stability_lambda,
             stability_scale=args.stability_scale,
+            box_stability_lambda=args.box_stability_lambda,
+            box_delta=args.box_delta,
         )
 
 

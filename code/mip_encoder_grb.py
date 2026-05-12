@@ -254,13 +254,33 @@ class MIPEncoderGRB:
             n_bin += n_bin_inc
             return y_vars, y_lo, y_hi, n_bin_inc
 
-        # 1. θ_n vars (normalized in [0,1])
+        # 1. θ_n vars — normalized to [0,1] within the FULL parameter range,
+        # but bounded to the TR box. CRITICAL (fixed 2026-05-12): the IBP
+        # bound propagation that classifies ReLU stability MUST start from the
+        # TR box, not the full [0,1] box — otherwise TR width has no effect on
+        # the binary count (which was the bug: 10,917 binaries regardless of
+        # whether the TR is 5%, 20% or 100% wide).
+        theta_range_12 = np.asarray(theta_upper_12, dtype=np.float64) - \
+                         np.asarray(theta_lower_12, dtype=np.float64)
+        theta_range_12 = np.where(theta_range_12 < 1e-12, 1.0, theta_range_12)
+        # Normalized TR box per (k, d, c)
+        theta_n_lo = np.empty((K, D, 12), dtype=np.float64)
+        theta_n_hi = np.empty((K, D, 12), dtype=np.float64)
+        for k in range(K):
+            for d in range(D):
+                for c in range(12):
+                    lo = (float(tr_lower_pd[k, d, c]) - float(theta_lower_12[c])) / theta_range_12[c]
+                    hi = (float(tr_upper_pd[k, d, c]) - float(theta_lower_12[c])) / theta_range_12[c]
+                    theta_n_lo[k, d, c] = float(np.clip(lo, 0.0, 1.0))
+                    theta_n_hi[k, d, c] = float(np.clip(hi, 0.0, 1.0))
         theta_n_vars = np.empty((K, D, 12), dtype=object)
         for k in range(K):
             for d in range(D):
                 for c in range(12):
                     theta_n_vars[k, d, c] = m.addVar(
-                        lb=0.0, ub=1.0, name=f"th_n_{k}_{d}_{c}")
+                        lb=float(theta_n_lo[k, d, c]),
+                        ub=float(theta_n_hi[k, d, c]),
+                        name=f"th_n_{k}_{d}_{c}")
         m.update()
 
         # 2. Per-zone CNN. Conv1 uses IA only (Tjeng footnote 4: IA optimal
@@ -284,11 +304,16 @@ class MIPEncoderGRB:
         for d in range(D):
             if verbose:
                 print(f"  [encode_pd_grb] zone {d}/{D-1}: encoding CNN layers")
+            # Conv input order matches ThetaEncoder1DCNN_Shared.forward:
+            #   permute(...,3,4,2).reshape(B*M*D, C=12, K) → x0 indexed [c*K + k].
             x0 = []
-            x0_lo = np.zeros(72); x0_hi = np.ones(72)
+            x0_lo = np.empty(12 * K, dtype=np.float64)
+            x0_hi = np.empty(12 * K, dtype=np.float64)
             for c in range(12):
                 for k in range(K):
                     x0.append(theta_n_vars[k, d, c])
+                    x0_lo[c * K + k] = theta_n_lo[k, d, c]
+                    x0_hi[c * K + k] = theta_n_hi[k, d, c]
 
             # conv1 — layer 1, IA only (no LP-PBT)
             z1, z1_lo, z1_hi = _add_linear_layer_grb(
@@ -458,6 +483,8 @@ class MIPEncoderGRB:
             'relu_groups': relu_groups,
             'relu_stats': relu_stats,
             'pbt_stats': pbt_stats,
+            'theta_n_lo': theta_n_lo,   # normalized TR box actually used for IBP
+            'theta_n_hi': theta_n_hi,
         }
         return m, info
 

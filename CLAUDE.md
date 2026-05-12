@@ -934,3 +934,83 @@ Robust retraining is a **necessary but not sufficient** ingredient for exact MIP
 - `results/zone_v2_attn_robust_seed{2026,2027,2028}.md`
 - `logs_robust_seed{2026,2027,2028}.log`
 - Trainer + pipeline changes (above)
+
+---
+
+## 2026-05-12 — Encoder TR-box IBP fix + box-robust retraining (binaries ~halved, still not MIP-tractable)
+
+**Trigger**: user pointed out Tjeng solves 48K-ReLU CNNs fast, so a CNN bottleneck "shouldn't" hit us. Re-examining Tjeng Table 6: those CNNs have **1–2% unstable ReLUs** *because they are certified-robustly trained* (LP-dual / Wong & Kolter), whose loss minimizes worst-case loss over the ε-box → forces pre-activation **intervals** (not point values) one-sided. Our v1 robust retrain only penalized point values near 0 → 63% unstable, MIP timed out.
+
+### Bug found + fixed: encoder ignored the TR box for IBP
+
+`mip_encoder_grb.encode_pd_v3_attn` set the conv input bounds to `np.zeros(72)/np.ones(72)` (full normalized [0,1] box) regardless of the `tr_lower_pd/tr_upper_pd` passed in — so the **binary count was invariant to TR width** (10,917 at 5%, 20%, or 100% TR). **Fixed**: encoder now normalizes the TR box per (k,d,c) and uses it both as the `theta_n` var bounds and as the conv1 IBP input bounds. Post-fix the binary count responds to TR width.
+
+### Phase 1 — TR-width sweep (post-fix, no retraining)
+
+| ckpt | 20% TR | 10% TR | 5% TR |
+|---|---|---|---|
+| first_mip seed2026 | 9,882 (conv 9,605) | 9,027 (conv 8,790) | 8,592 (conv 8,380) |
+| robust_v1 seed2026 | 9,158 (conv 8,190) | 8,343 (conv 7,385) | 7,758 (conv 6,890) |
+| robust_v1 seed2027 | 9,103 | 8,073 | 7,643 |
+| robust_v1 seed2028 | 8,670 | 7,533 | 7,043 |
+
+TR-shrinking helps modestly but conv-layer IBP looseness (3 conv layers compound) keeps binaries > 7K — far above the ~3K tractability threshold. **Phase 1 insufficient.**
+
+### Phase 2 — box-robust retraining (certified IBP-style)
+
+New code:
+- `code/per_district/ccnn_pd_v3_model.py`: `ibp_conv_stack(theta_encoder, x_lo, x_hi)` — differentiable IBP through conv1→relu→conv2→relu→conv3→relu→proj→relu (unit-tested: at δ=0 the IBP midpoint == real forward to 1e-7). Trainer gains `box_stability_lambda`, `box_delta`; `compute_loss` adds the **dimensionless box-stability penalty** `mean over the 4 conv-ReLU layers of mean( min(relu(-l),relu(u)) / (u-l) )` ∈ [0, 0.5] over the box [θ_n − δ, θ_n + δ]. (0 iff every unit one-sided; well-calibrated regardless of layer scale.)
+- `code/per_district/ccnn_zone_v2_attn_pipeline.py`: CLI `--box-stability-lambda` (used 2.0), `--box-delta` (used 0.1 = 20% box width matching the MIP TR); ckpt naming `ccnn_zone_v2_attn_boxrobust_seed{seed}.pt`.
+
+**Accuracy** (3 seeds, same 1000-ABM data, IBP roughly doubled training time → ~20 min/seed CPU):
+
+| Metric | first_mip | robust_v1 | **box-robust (mean ± std)** |
+|---|---|---|---|
+| City 3-obj overall | 7.20% | 7.61% | **7.72 ± 0.27%** (seeds 7.40 / 7.87 / 7.90) |
+| Per-zone 6-stage | 14.40% | 14.90% | **15.59 ± 0.65%** (15.00 / 16.27 / 15.51) — slightly above the 15% Goal-3 bar |
+| Per-zone k=5 | 11.89% | 12.83% | **13.56 ± 0.79%** (12.83 / 14.37 / 13.48) |
+| City Adoption / Revenue / Carbon | 5.65 / 9.32 / 6.63 | 6.35 / 10.02 / 6.45 | 6.88 / 9.86 / 6.43 |
+
+City accuracy still well within the ≤12% acceptable bound; 6-stage marginally exceeds 15%.
+
+**Per-layer stable fraction** @ 20% TR, box-robust seed 2027 (vs robust_v1):
+
+| Layer | robust_v1 stable% | **box-robust stable%** | mixed (box-robust) |
+|---|---|---|---|
+| L1r (conv1) | ~6% | **92.2%** | 30/zone |
+| L2r (conv2) | ~6% | **62.1%** | 291/zone |
+| L3r (conv3) | ~20% | **49.2%** | 390/zone |
+| Prr (proj)  | ~33% | 30.5% | 89/zone |
+| PSAr | 0% | **0%** (unchanged — not in `ibp_conv_stack`) | 128 |
+| D0r | ~66% | 59.0% | 210/zone |
+| D3r | ~98% | 97.3% | 7/zone |
+| TQEr | ~98% | 68.8% | 20 |
+
+**Binary count** @ 20% TR: robust_v1 ~9,100 → **box-robust 5,233 (seed2027) / 6,203 (seed2026) / 6,237 (seed2028)** — conv binaries roughly halved (≈8,100 → 4,000–5,300). Conv1 dramatically fixed (6% → 92%), conv2 strongly improved (6% → 53–62%), conv3 moderately (20% → 32–49%).
+
+**MIP solve_exact** (box-robust seed2027, the best, at decreasing TR width):
+
+| TR width | binaries | solve_exact (1800s budget) |
+|---|---|---|
+| 20% | 5,233 | TIMEOUT 1801s, 0 incumbents |
+| 10% | 4,302 | TIMEOUT 1801s, 0 incumbents |
+| 5%  | 3,828 | TIMEOUT 1800s, 0 incumbents |
+
+### Verdict
+
+Box-robust IBP-bound training is the *correct* lever (Tjeng's networks have it; ours didn't) and it **roughly halved the binary count** with conv1 going from 6% → 92% stable — a real, large win. But the residual ~3.8–5.2K binaries (mostly conv2 ≈1.5K + conv3 ≈2K + PSAr 128) still exceed Gurobi's 30-min limit on this constraint structure: even at 5% TR with 3,828 binaries the MIP gets stuck at the root node generating cuts (RLT/MIR/Flow-cover), never branching to an incumbent — the same pathology as first_mip.
+
+### Next-step recommendations (not yet executed)
+
+1. **Stronger / extended box penalty**: bump `box_stability_lambda` to ~5.0 (accept more accuracy regression), and **extend `ibp_conv_stack` through `per_sample_agg.proj`** (PSAr is stuck at 0% stable, 128 binaries) — also weight L2r/L3r more heavily in the penalty (they're the loosest remaining). Could plausibly get to ~2.5–3K binaries.
+2. **αβ-CROWN / auto_LiRPA for the conv stack**: the box-robust training made the network's IBP bounds tight; CROWN bounds (linear backward propagation, accounts for cross-layer correlations) on the *same trained network* would be tighter still — potentially halving the conv binaries again. ~4–5 day integration.
+3. **Architectural**: drop one conv layer (12→64→128 instead of 12→64→128→128) — fewer compounding IBP steps. Costs accuracy.
+4. **Production stays on LP-relaxation acquisition** (22s/MIP, +28% HV validated) until one of the above lands.
+
+### Files / artifacts (2026-05-12)
+
+- `code/mip_encoder_grb.py` — TR-box IBP fix (`theta_n_lo/theta_n_hi`, conv input bounds from TR box, `info['theta_n_lo/hi']`).
+- `code/per_district/ccnn_pd_v3_model.py` — `ibp_conv_stack`, `_conv1d_ibp`, `_linear_ibp`, trainer `box_stability_lambda/box_delta`, `_box_stability_penalty`, `compute_loss(target_theta_n=...)`.
+- `code/per_district/ccnn_zone_v2_attn_pipeline.py` — `--box-stability-lambda`, `--box-delta`, `..._boxrobust_seed{seed}.pt` naming.
+- `code/tests/test_mip_trwidth_sweep.py` — NEW (Phase 1 sweep).
+- `checkpoints/ccnn_zone_v2_attn_boxrobust_seed{2026,2027,2028}.pt`, `results/zone_v2_attn_boxrobust_seed{2026,2027,2028}.md`, `logs_boxrobust_seed{2026,2027,2028}.log`.
